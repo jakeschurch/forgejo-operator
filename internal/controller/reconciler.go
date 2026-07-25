@@ -232,11 +232,22 @@ func (r *OrganizationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			ID int64 `json:"id"`
 		}
 		err = api.Do(ctx, http.MethodGet, "orgs/"+object.Spec.Name, nil, &remote)
+		payload := map[string]any{}
+		if object.Spec.FullName != "" {
+			payload["full_name"] = object.Spec.FullName
+		}
+		if object.Spec.Description != "" {
+			payload["description"] = object.Spec.Description
+		}
+		if object.Spec.Visibility != "" {
+			payload["visibility"] = object.Spec.Visibility
+		}
 		var apiErr *forgeapi.APIError
 		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
-			err = api.Do(ctx, http.MethodPost, "orgs", map[string]any{"username": object.Spec.Name, "full_name": object.Spec.FullName, "description": object.Spec.Description, "visibility": object.Spec.Visibility}, &remote)
-		} else if err == nil {
-			err = api.Do(ctx, http.MethodPatch, "orgs/"+object.Spec.Name, map[string]any{"full_name": object.Spec.FullName, "description": object.Spec.Description, "visibility": object.Spec.Visibility}, nil)
+			payload["username"] = object.Spec.Name
+			err = api.Do(ctx, http.MethodPost, "orgs", payload, &remote)
+		} else if err == nil && len(payload) > 0 {
+			err = api.Do(ctx, http.MethodPatch, "orgs/"+object.Spec.Name, payload, nil)
 		}
 		if err == nil {
 			object.Status.RemoteID = fmt.Sprint(remote.ID)
@@ -296,7 +307,10 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		var apiErr *forgeapi.APIError
 		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
 			if object.Spec.Import != nil {
-				payload := map[string]any{"clone_addr": object.Spec.Import.CloneURL, "repo_owner": object.Spec.Owner, "repo_name": object.Spec.Name, "description": object.Spec.Description}
+				payload := map[string]any{"clone_addr": object.Spec.Import.CloneURL, "repo_owner": object.Spec.Owner, "repo_name": object.Spec.Name}
+				if object.Spec.Description != "" {
+					payload["description"] = object.Spec.Description
+				}
 				if object.Spec.Import.CredentialsSecretRef != nil {
 					credential, secretErr := r.readSecret(ctx, object.Namespace, *object.Spec.Import.CredentialsSecretRef, "token")
 					if secretErr != nil {
@@ -309,10 +323,17 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 					err = api.Do(ctx, http.MethodPost, "repos/migrate", payload, &remote)
 				}
 			} else {
-				err = api.Do(ctx, http.MethodPost, "orgs/"+object.Spec.Owner+"/repos", map[string]any{"name": object.Spec.Name, "description": object.Spec.Description}, &remote)
+				payload := map[string]any{"name": object.Spec.Name}
+				if object.Spec.Description != "" {
+					payload["description"] = object.Spec.Description
+				}
+				err = api.Do(ctx, http.MethodPost, "orgs/"+object.Spec.Owner+"/repos", payload, &remote)
 			}
 		} else if err == nil {
-			err = api.Do(ctx, http.MethodPatch, path, map[string]any{"description": object.Spec.Description, "default_branch": object.Spec.DefaultBranch}, nil)
+			payload := repositoryPatch(object.Spec)
+			if len(payload) > 0 {
+				err = api.Do(ctx, http.MethodPatch, path, payload, nil)
+			}
 		}
 		if err == nil && len(object.Spec.Topics) > 0 {
 			err = api.Do(ctx, http.MethodPut, path+"/topics", map[string]any{"topics": object.Spec.Topics}, nil)
@@ -329,6 +350,23 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 	return ctrl.Result{RequeueAfter: 10 * time.Minute}, nil
+}
+
+func repositoryPatch(spec forgev1.RepositorySpec) map[string]any {
+	payload := map[string]any{}
+	if spec.Description != "" {
+		payload["description"] = spec.Description
+	}
+	if spec.DefaultBranch != "" {
+		payload["default_branch"] = spec.DefaultBranch
+	}
+	if spec.Visibility != "" {
+		payload["private"] = spec.Visibility == "private"
+	}
+	for feature, enabled := range spec.Features {
+		payload["has_"+feature] = enabled
+	}
+	return payload
 }
 func (r *RepositoryReconciler) SetupWithManager(m ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(m).For(&forgev1.ForgejoRepository{}).Complete(r)

@@ -82,6 +82,16 @@ func TestDuplicateNaturalKeyRejected(t *testing.T) {
 	}
 }
 
+func TestRepositoryPatchPreservesOmittedFields(t *testing.T) {
+	if payload := repositoryPatch(forgev1.RepositorySpec{}); len(payload) != 0 {
+		t.Fatalf("omitted fields produced authoritative patch: %#v", payload)
+	}
+	payload := repositoryPatch(forgev1.RepositorySpec{DefaultBranch: "main", Visibility: "private", Features: map[string]bool{"issues": false}})
+	if payload["default_branch"] != "main" || payload["private"] != true || payload["has_issues"] != false {
+		t.Fatalf("declared fields missing from patch: %#v", payload)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

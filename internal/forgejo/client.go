@@ -61,6 +61,20 @@ func (e *APIError) Error() string {
 }
 
 func (c *Client) Do(ctx context.Context, method, path string, in, out any) error {
+	return c.do(ctx, method, path, in, out, func(req *http.Request) {
+		req.Header.Set("Authorization", "token "+c.token)
+	})
+}
+
+// DoBasic is reserved for Forgejo operations, such as token creation, that
+// explicitly require the target account's password instead of an admin token.
+func (c *Client) DoBasic(ctx context.Context, method, path, username, password string, in, out any) error {
+	return c.do(ctx, method, path, in, out, func(req *http.Request) {
+		req.SetBasicAuth(username, password)
+	})
+}
+
+func (c *Client) do(ctx context.Context, method, path string, in, out any, authenticate func(*http.Request)) error {
 	var body []byte
 	var err error
 	if in != nil {
@@ -82,7 +96,7 @@ func (c *Client) Do(ctx context.Context, method, path string, in, out any) error
 			return errors.New("construct Forgejo API request")
 		}
 		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Authorization", "token "+c.token)
+		authenticate(req)
 		if in != nil {
 			req.Header.Set("Content-Type", "application/json")
 		}

@@ -281,8 +281,33 @@ func (r *managedReconciler) reconcile(ctx context.Context, api *forgeapi.Client,
 			ID   int64  `json:"id"`
 			SHA1 string `json:"sha1"`
 		}
-		path := "users/" + esc(v.Spec.Username) + "/tokens?sudo=" + url.QueryEscape(v.Spec.Username)
-		if err := api.Do(ctx, http.MethodPost, path, map[string]any{"name": v.Spec.Name, "scopes": v.Spec.Scopes}, &created); err != nil {
+		var robots forgev1.ForgejoRobotAccountList
+		if err := r.List(ctx, &robots, client.InNamespace(v.Namespace)); err != nil {
+			return "", fmt.Errorf("list robot accounts: %w", err)
+		}
+		passwordSecretName := ""
+		for i := range robots.Items {
+			robot := &robots.Items[i]
+			if robot.Spec.ProviderRef == v.Spec.ProviderRef && robot.Spec.Username == v.Spec.Username {
+				passwordSecretName = robot.Spec.PasswordSecretName
+				if passwordSecretName == "" {
+					passwordSecretName = robot.Name + "-password"
+				}
+				break
+			}
+		}
+		if passwordSecretName == "" {
+			return "", errors.New("access token username must reference a managed robot account")
+		}
+		password, err := r.secretValue(ctx, v.Namespace, corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: passwordSecretName},
+			Key:                  "password",
+		}, "password")
+		if err != nil {
+			return "", fmt.Errorf("read robot credential: %w", err)
+		}
+		path := "users/" + esc(v.Spec.Username) + "/tokens"
+		if err := api.DoBasic(ctx, http.MethodPost, path, v.Spec.Username, password, map[string]any{"name": v.Spec.Name, "scopes": v.Spec.Scopes}, &created); err != nil {
 			return "", err
 		}
 		secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: v.Namespace, Annotations: map[string]string{credentials.RotationNonceAnnotation: v.Spec.RotationNonce}}, Type: corev1.SecretTypeOpaque, Data: map[string][]byte{"token": []byte(created.SHA1)}}

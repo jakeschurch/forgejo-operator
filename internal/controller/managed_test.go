@@ -42,14 +42,27 @@ func TestCollaboratorRequest(t *testing.T) {
 	}
 }
 
-func TestAccessTokenUsesAdminSudo(t *testing.T) {
+func TestAccessTokenUsesRobotPassword(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	_ = forgev1.AddToScheme(scheme)
-	kube := fake.NewClientBuilder().WithScheme(scheme).Build()
-	var method, path, sudo string
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&forgev1.ForgejoRobotAccount{
+			ObjectMeta: metav1.ObjectMeta{Name: "argo-workflows", Namespace: "argo"},
+			Spec: forgev1.RobotAccountSpec{
+				CommonSpec: forgev1.CommonSpec{ProviderRef: "default"},
+				Username:   "argo-workflows", PasswordSecretName: "robot-password",
+			},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "robot-password", Namespace: "argo"},
+			Data:       map[string][]byte{"password": []byte("sensitive-password")},
+		},
+	).Build()
+	var method, path, username, password string
 	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		method, path, sudo = r.Method, r.URL.Path, r.URL.Query().Get("sudo")
+		method, path = r.Method, r.URL.Path
+		username, password, _ = r.BasicAuth()
 		return response(http.StatusCreated, `{"id":7,"sha1":"generated-token"}`), nil
 	})
 	api, _ := forgeapi.New("https://forgejo.invalid", "admin", forgeapi.WithHTTPClient(&http.Client{Transport: transport}), forgeapi.WithRetries(0))
@@ -65,8 +78,9 @@ func TestAccessTokenUsesAdminSudo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if id != "7" || method != http.MethodPost || path != "/api/v1/users/argo-workflows/tokens" || sudo != "argo-workflows" {
-		t.Fatalf("id=%q method=%s path=%s sudo=%s", id, method, path, sudo)
+	if id != "7" || method != http.MethodPost || path != "/api/v1/users/argo-workflows/tokens" ||
+		username != "argo-workflows" || password != "sensitive-password" {
+		t.Fatalf("id=%q method=%s path=%s username=%s passwordMatch=%t", id, method, path, username, password == "sensitive-password")
 	}
 	var secret corev1.Secret
 	if err := kube.Get(context.Background(), client.ObjectKey{Namespace: "argo", Name: "reader-token"}, &secret); err != nil {

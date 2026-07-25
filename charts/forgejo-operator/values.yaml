@@ -13,6 +13,8 @@ networkPolicy:
   enabled: true
   forgejoNamespace: forgejo
   forgejoPort: 3000
+  apiServerCIDR: 10.43.0.1/32
+  apiServerPort: 443
 metrics:
   secure: true
   port: 8443

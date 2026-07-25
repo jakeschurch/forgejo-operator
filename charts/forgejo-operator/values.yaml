@@ -18,6 +18,9 @@ networkPolicy:
   # Some CNIs enforce policy both before and after Kubernetes Service DNAT.
   apiServerEndpointCIDR: ""
   apiServerEndpointPort: 6443
+  ciliumApiServerEntity:
+    enabled: false
+    port: 6443
 metrics:
   secure: true
   port: 8443

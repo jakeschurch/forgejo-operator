@@ -1,0 +1,17 @@
+{{- if and .Values.networkPolicy.enabled .Values.networkPolicy.ciliumApiServerEntity.enabled }}
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: {{ include "forgejo-operator.name" . }}-kube-apiserver
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "forgejo-operator.name" . }}
+  egress:
+    - toEntities:
+        - kube-apiserver
+      toPorts:
+        - ports:
+            - port: {{ .Values.networkPolicy.ciliumApiServerEntity.port | quote }}
+              protocol: TCP
+{{- end }}

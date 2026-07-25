@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "forgejo_operator_work",
+  "project_id": "ee5805c6-84a5-4bb9-a27f-057b5c960e9c"
+}

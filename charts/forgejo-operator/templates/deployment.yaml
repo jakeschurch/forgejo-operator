@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "forgejo-operator.name" . }}
+  labels: {{- include "forgejo-operator.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "forgejo-operator.name" . }}
+  template:
+    metadata:
+      labels: {{- include "forgejo-operator.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "forgejo-operator.name" . }}
+      securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: manager
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --leader-elect
+            - --metrics-secure={{ .Values.metrics.secure }}
+          ports:
+            - { name: metrics, containerPort: {{ .Values.metrics.port }} }
+            - { name: health, containerPort: 8081 }
+          livenessProbe: { httpGet: { path: /healthz, port: health } }
+          readinessProbe: { httpGet: { path: /readyz, port: health } }
+          resources: {{ toYaml .Values.resources | nindent 12 }}
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] }, readOnlyRootFilesystem: true }

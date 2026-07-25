@@ -1,0 +1,15 @@
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "forgejo-operator.name" . }}
+  labels: {{- include "forgejo-operator.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "forgejo-operator.name" . }}
+  endpoints:
+    - port: metrics
+      scheme: {{ ternary "https" "http" .Values.metrics.secure }}
+      path: /metrics
+{{- end }}

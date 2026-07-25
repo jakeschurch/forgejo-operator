@@ -1,0 +1,18 @@
+replicaCount: 1
+image:
+  repository: harbor.oci-registry.svc.cluster.local/foundry/forgejo-operator
+  tag: latest
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+resources:
+  requests: { cpu: 25m, memory: 64Mi }
+  limits: { memory: 256Mi }
+serviceMonitor:
+  enabled: false
+networkPolicy:
+  enabled: true
+  forgejoNamespace: forgejo
+  forgejoPort: 3000
+metrics:
+  secure: true
+  port: 8443

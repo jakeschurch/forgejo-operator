@@ -40,11 +40,13 @@ func main() {
 		os.Exit(1)
 	}
 	base := controller.Reconciler{Client: manager.GetClient()}
-	for _, setup := range []func(ctrl.Manager) error{
+	setups := []func(ctrl.Manager) error{
 		(&controller.ProviderReconciler{Reconciler: base}).SetupWithManager,
 		(&controller.OrganizationReconciler{Reconciler: base}).SetupWithManager,
 		(&controller.RepositoryReconciler{Reconciler: base}).SetupWithManager,
-	} {
+	}
+	setups = append(setups, controller.ManagedSetups(base)...)
+	for _, setup := range setups {
 		if err := setup(manager); err != nil {
 			os.Exit(1)
 		}

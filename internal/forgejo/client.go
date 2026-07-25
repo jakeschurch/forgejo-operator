@@ -11,29 +11,40 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const maxBody = 4 << 20
 
 type Client struct {
-	base    *url.URL
-	token   string
-	http    *http.Client
-	retries int
+	base        *url.URL
+	token       string
+	http        *http.Client
+	retries     int
+	rateMu      sync.Mutex
+	nextRequest time.Time
+	minInterval time.Duration
 }
 
 type Option func(*Client)
 
 func WithHTTPClient(v *http.Client) Option { return func(c *Client) { c.http = v } }
 func WithRetries(v int) Option             { return func(c *Client) { c.retries = v } }
+func WithRateLimit(requestsPerSecond int) Option {
+	return func(c *Client) {
+		if requestsPerSecond > 0 {
+			c.minInterval = time.Second / time.Duration(requestsPerSecond)
+		}
+	}
+}
 
 func New(rawURL, token string, opts ...Option) (*Client, error) {
 	base, err := url.Parse(strings.TrimRight(rawURL, "/") + "/api/v1/")
 	if err != nil || (base.Scheme != "http" && base.Scheme != "https") {
 		return nil, errors.New("invalid Forgejo API URL")
 	}
-	c := &Client{base: base, token: token, retries: 3, http: &http.Client{Timeout: 15 * time.Second}}
+	c := &Client{base: base, token: token, retries: 3, minInterval: 100 * time.Millisecond, http: &http.Client{Timeout: 15 * time.Second}}
 	for _, opt := range opts {
 		opt(c)
 	}
@@ -63,6 +74,9 @@ func (c *Client) Do(ctx context.Context, method, path string, in, out any) error
 		return errors.New("invalid Forgejo API path")
 	}
 	for attempt := 0; ; attempt++ {
+		if err := c.waitRate(ctx); err != nil {
+			return err
+		}
 		req, reqErr := http.NewRequestWithContext(ctx, method, endpoint.String(), bytes.NewReader(body))
 		if reqErr != nil {
 			return errors.New("construct Forgejo API request")
@@ -96,13 +110,8 @@ func (c *Client) Do(ctx context.Context, method, path string, in, out any) error
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			message := http.StatusText(resp.StatusCode)
-			var payload struct {
-				Message string `json:"message"`
-			}
-			if json.Unmarshal(data, &payload) == nil && payload.Message != "" {
-				message = payload.Message
-			}
-			// Never include the URL, request, headers, or raw response: any can contain credentials.
+			// Never include the URL, request, headers, or response body: Forgejo
+			// may echo credential-bearing fields in validation errors.
 			return &APIError{StatusCode: resp.StatusCode, Message: message}
 		}
 		if out != nil && len(data) != 0 {
@@ -110,6 +119,28 @@ func (c *Client) Do(ctx context.Context, method, path string, in, out any) error
 				return errors.New("decode Forgejo API response")
 			}
 		}
+		return nil
+	}
+}
+
+func (c *Client) waitRate(ctx context.Context) error {
+	c.rateMu.Lock()
+	now := time.Now()
+	waitFor := time.Duration(0)
+	if now.Before(c.nextRequest) {
+		waitFor = c.nextRequest.Sub(now)
+	}
+	c.nextRequest = now.Add(waitFor).Add(c.minInterval)
+	c.rateMu.Unlock()
+	if waitFor == 0 {
+		return nil
+	}
+	timer := time.NewTimer(waitFor)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
 		return nil
 	}
 }

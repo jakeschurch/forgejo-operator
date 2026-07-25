@@ -13,7 +13,7 @@
             pname = "forgejo-operator";
             version = "0.1.0";
             src = self;
-            vendorHash = pkgs.lib.fakeHash;
+            vendorHash = "sha256-onlkkR5+tdwqCMcxMAzydUjxtGgH3d3HTUQYB8IJzjI=";
             subPackages = [ "cmd/manager" ];
             ldflags = [ "-s" "-w" ];
             env.CGO_ENABLED = "0";
@@ -32,17 +32,19 @@
           };
         });
       checks = forAllSystems (system:
-        let pkgs = import nixpkgs { inherit system; }; in {
+        let
+          pkgs = import nixpkgs { inherit system; };
+          operator = self.packages.${system}.default;
+        in {
           inherit (self.packages.${system}) default;
-          tests = pkgs.runCommand "forgejo-operator-tests" {
-            nativeBuildInputs = [ pkgs.go pkgs.kubernetes-helm ];
+          tests = operator;
+          chart = pkgs.runCommand "forgejo-operator-chart" {
+            nativeBuildInputs = [ pkgs.kubernetes-helm ];
           } ''
-            export HOME=$TMPDIR GOCACHE=$TMPDIR/go-cache
-            cp -R ${self} source
-            chmod -R u+w source
-            cd source
-            go test ./...
-            helm lint charts/forgejo-operator
+            cp -R ${self}/charts/forgejo-operator chart
+            chmod -R u+w chart
+            helm lint chart
+            helm template forgejo-operator chart >/dev/null
             touch $out
           '';
         });

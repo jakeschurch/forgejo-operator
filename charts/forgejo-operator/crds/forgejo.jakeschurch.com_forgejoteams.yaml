@@ -71,6 +71,10 @@ spec:
             - organization
             - providerRef
             type: object
+            x-kubernetes-validations:
+            - message: providerRef, organization, and name are immutable
+              rule: self.providerRef == oldSelf.providerRef && self.organization ==
+                oldSelf.organization && self.name == oldSelf.name
           status:
             properties:
               conditions:

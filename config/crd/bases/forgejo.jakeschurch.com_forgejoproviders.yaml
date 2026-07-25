@@ -37,6 +37,12 @@ spec:
             type: object
           spec:
             properties:
+              externalURL:
+                description: |-
+                  ExternalURL is the canonical user-facing URL for this installation.
+                  API reconciliation still uses URL so in-cluster traffic stays private.
+                pattern: ^https?://
+                type: string
               requestTimeout:
                 type: string
               tokenSecretRef:
@@ -69,6 +75,9 @@ spec:
             - tokenSecretRef
             - url
             type: object
+            x-kubernetes-validations:
+            - message: url is immutable
+              rule: self.url == oldSelf.url
           status:
             properties:
               conditions:

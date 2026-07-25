@@ -102,6 +102,10 @@ spec:
             - owner
             - providerRef
             type: object
+            x-kubernetes-validations:
+            - message: providerRef, owner, and name are immutable
+              rule: self.providerRef == oldSelf.providerRef && self.owner == oldSelf.owner
+                && self.name == oldSelf.name
           status:
             properties:
               conditions:

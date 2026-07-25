@@ -29,9 +29,14 @@ type CommonStatus struct {
 	Conditions             []metav1.Condition            `json:"conditions,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="self.url == oldSelf.url",message="url is immutable"
 type ForgejoProviderSpec struct {
 	// +kubebuilder:validation:Pattern=`^https?://`
-	URL            string                   `json:"url"`
+	URL string `json:"url"`
+	// ExternalURL is the canonical user-facing URL for this installation.
+	// API reconciliation still uses URL so in-cluster traffic stays private.
+	// +kubebuilder:validation:Pattern=`^https?://`
+	ExternalURL    string                   `json:"externalURL,omitempty"`
 	TokenSecretRef corev1.SecretKeySelector `json:"tokenSecretRef"`
 	RequestTimeout metav1.Duration          `json:"requestTimeout,omitempty"`
 }
@@ -52,6 +57,7 @@ type ForgejoProviderList struct {
 	Items           []ForgejoProvider `json:"items"`
 }
 
+// +kubebuilder:validation:XValidation:rule="self.providerRef == oldSelf.providerRef && self.name == oldSelf.name",message="providerRef and name are immutable"
 type OrganizationSpec struct {
 	CommonSpec  `json:",inline"`
 	Name        string `json:"name"`
@@ -76,6 +82,7 @@ type ForgejoOrganizationList struct {
 	Items           []ForgejoOrganization `json:"items"`
 }
 
+// +kubebuilder:validation:XValidation:rule="self.providerRef == oldSelf.providerRef && self.organization == oldSelf.organization && self.name == oldSelf.name",message="providerRef, organization, and name are immutable"
 type TeamSpec struct {
 	CommonSpec              `json:",inline"`
 	Organization            string   `json:"organization"`
@@ -86,12 +93,16 @@ type TeamSpec struct {
 	Units                   []string `json:"units,omitempty"`
 	Repositories            []string `json:"repositories,omitempty"`
 }
+
+// +kubebuilder:validation:XValidation:rule="self.providerRef == oldSelf.providerRef && self.organization == oldSelf.organization && self.username == oldSelf.username",message="providerRef, organization, and username are immutable"
 type MembershipSpec struct {
 	CommonSpec   `json:",inline"`
 	Organization string   `json:"organization"`
 	Username     string   `json:"username"`
 	Teams        []string `json:"teams,omitempty"`
 }
+
+// +kubebuilder:validation:XValidation:rule="self.providerRef == oldSelf.providerRef && self.username == oldSelf.username",message="providerRef and username are immutable"
 type RobotAccountSpec struct {
 	CommonSpec         `json:",inline"`
 	Username           string `json:"username"`
@@ -99,6 +110,8 @@ type RobotAccountSpec struct {
 	PasswordSecretName string `json:"passwordSecretName,omitempty"`
 	RotationNonce      string `json:"rotationNonce,omitempty"`
 }
+
+// +kubebuilder:validation:XValidation:rule="self.providerRef == oldSelf.providerRef && self.username == oldSelf.username && self.name == oldSelf.name",message="providerRef, username, and name are immutable"
 type AccessTokenSpec struct {
 	CommonSpec    `json:",inline"`
 	Username      string   `json:"username"`
@@ -107,6 +120,8 @@ type AccessTokenSpec struct {
 	SecretName    string   `json:"secretName,omitempty"`
 	RotationNonce string   `json:"rotationNonce,omitempty"`
 }
+
+// +kubebuilder:validation:XValidation:rule="self.providerRef == oldSelf.providerRef && self.owner == oldSelf.owner && self.name == oldSelf.name",message="providerRef, owner, and name are immutable"
 type RepositorySpec struct {
 	CommonSpec    `json:",inline"`
 	Owner         string            `json:"owner"`
@@ -122,6 +137,8 @@ type RepositoryImport struct {
 	CloneURL             string                    `json:"cloneURL"`
 	CredentialsSecretRef *corev1.SecretKeySelector `json:"credentialsSecretRef,omitempty"`
 }
+
+// +kubebuilder:validation:XValidation:rule="self.providerRef == oldSelf.providerRef && self.owner == oldSelf.owner && self.repository == oldSelf.repository && self.username == oldSelf.username",message="remote identity fields are immutable"
 type CollaboratorSpec struct {
 	CommonSpec `json:",inline"`
 	Owner      string `json:"owner"`
@@ -129,6 +146,8 @@ type CollaboratorSpec struct {
 	Username   string `json:"username"`
 	Permission string `json:"permission"`
 }
+
+// +kubebuilder:validation:XValidation:rule="self.providerRef == oldSelf.providerRef && self.owner == oldSelf.owner && self.repository == oldSelf.repository && self.title == oldSelf.title",message="remote identity fields are immutable"
 type DeployKeySpec struct {
 	CommonSpec         `json:",inline"`
 	Owner              string                   `json:"owner"`
@@ -137,6 +156,8 @@ type DeployKeySpec struct {
 	PublicKeySecretRef corev1.SecretKeySelector `json:"publicKeySecretRef"`
 	ReadOnly           bool                     `json:"readOnly,omitempty"`
 }
+
+// +kubebuilder:validation:XValidation:rule="self.providerRef == oldSelf.providerRef && self.owner == oldSelf.owner && self.repository == oldSelf.repository && self.url == oldSelf.url",message="remote identity fields are immutable"
 type WebhookSpec struct {
 	CommonSpec          `json:",inline"`
 	Owner               string                    `json:"owner"`
@@ -148,6 +169,8 @@ type WebhookSpec struct {
 	GeneratedSecretName string                    `json:"generatedSecretName,omitempty"`
 	RotationNonce       string                    `json:"rotationNonce,omitempty"`
 }
+
+// +kubebuilder:validation:XValidation:rule="self.providerRef == oldSelf.providerRef && self.owner == oldSelf.owner && self.repository == oldSelf.repository && self.destinationURL == oldSelf.destinationURL",message="remote identity fields are immutable"
 type PushMirrorSpec struct {
 	CommonSpec           `json:",inline"`
 	Owner                string                   `json:"owner"`
@@ -157,6 +180,8 @@ type PushMirrorSpec struct {
 	SyncOnCommit         bool                     `json:"syncOnCommit,omitempty"`
 	CredentialsSecretRef corev1.SecretKeySelector `json:"credentialsSecretRef"`
 }
+
+// +kubebuilder:validation:XValidation:rule="self.providerRef == oldSelf.providerRef && self.owner == oldSelf.owner && self.repository == oldSelf.repository && self.branch == oldSelf.branch",message="remote identity fields are immutable"
 type BranchProtectionSpec struct {
 	CommonSpec             `json:",inline"`
 	Owner                  string   `json:"owner"`
@@ -167,6 +192,8 @@ type BranchProtectionSpec struct {
 	EnablePush             bool     `json:"enablePush,omitempty"`
 	EnableMerge            bool     `json:"enableMerge,omitempty"`
 }
+
+// +kubebuilder:validation:XValidation:rule="self.providerRef == oldSelf.providerRef && self.owner == oldSelf.owner && self.repository == oldSelf.repository && self.pattern == oldSelf.pattern",message="remote identity fields are immutable"
 type TagProtectionSpec struct {
 	CommonSpec     `json:",inline"`
 	Owner          string   `json:"owner"`
@@ -175,6 +202,8 @@ type TagProtectionSpec struct {
 	WhitelistUsers []string `json:"whitelistUsers,omitempty"`
 	WhitelistTeams []string `json:"whitelistTeams,omitempty"`
 }
+
+// +kubebuilder:validation:XValidation:rule="self.providerRef == oldSelf.providerRef && self.owner == oldSelf.owner && self.repository == oldSelf.repository && self.name == oldSelf.name",message="remote identity fields are immutable"
 type LabelSpec struct {
 	CommonSpec  `json:",inline"`
 	Owner       string `json:"owner"`

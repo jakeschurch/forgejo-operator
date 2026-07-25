@@ -88,6 +88,11 @@ spec:
             - providerRef
             - repository
             type: object
+            x-kubernetes-validations:
+            - message: remote identity fields are immutable
+              rule: self.providerRef == oldSelf.providerRef && self.owner == oldSelf.owner
+                && self.repository == oldSelf.repository && self.destinationURL ==
+                oldSelf.destinationURL
           status:
             properties:
               conditions:

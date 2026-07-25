@@ -12,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -38,6 +39,66 @@ func TestCollaboratorRequest(t *testing.T) {
 	}
 	if id != "robot" || method != http.MethodPut || path != "/api/v1/repos/jakeschurch/homelab/collaborators/robot" || !strings.Contains(body, `"permission":"read"`) {
 		t.Fatalf("id=%q method=%s path=%s body=%s", id, method, path, body)
+	}
+}
+
+func TestAccessTokenUsesAdminSudo(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = forgev1.AddToScheme(scheme)
+	kube := fake.NewClientBuilder().WithScheme(scheme).Build()
+	var method, path, sudo string
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		method, path, sudo = r.Method, r.URL.Path, r.URL.Query().Get("sudo")
+		return response(http.StatusCreated, `{"id":7,"sha1":"generated-token"}`), nil
+	})
+	api, _ := forgeapi.New("https://forgejo.invalid", "admin", forgeapi.WithHTTPClient(&http.Client{Transport: transport}), forgeapi.WithRetries(0))
+	object := &forgev1.ForgejoAccessToken{
+		ObjectMeta: metav1.ObjectMeta{Name: "reader", Namespace: "argo"},
+		Spec: forgev1.AccessTokenSpec{
+			CommonSpec: forgev1.CommonSpec{ProviderRef: "default"},
+			Username:   "argo-workflows", Name: "private-flakes", SecretName: "reader-token",
+		},
+	}
+	reconciler := managedReconciler{Reconciler: Reconciler{Client: kube}}
+	id, err := reconciler.reconcile(context.Background(), api, object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "7" || method != http.MethodPost || path != "/api/v1/users/argo-workflows/tokens" || sudo != "argo-workflows" {
+		t.Fatalf("id=%q method=%s path=%s sudo=%s", id, method, path, sudo)
+	}
+	var secret corev1.Secret
+	if err := kube.Get(context.Background(), client.ObjectKey{Namespace: "argo", Name: "reader-token"}, &secret); err != nil {
+		t.Fatal(err)
+	}
+	if string(secret.Data["token"]) != "generated-token" {
+		t.Fatal("generated token was not stored")
+	}
+}
+
+func TestMembershipAddsUserThroughTeam(t *testing.T) {
+	var requests []string
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		if r.Method == http.MethodGet {
+			return response(http.StatusOK, `{"data":[{"id":9,"name":"flake-readers"}]}`), nil
+		}
+		return response(http.StatusNoContent, ""), nil
+	})
+	api, _ := forgeapi.New("https://forgejo.invalid", "admin", forgeapi.WithHTTPClient(&http.Client{Transport: transport}), forgeapi.WithRetries(0))
+	object := &forgev1.ForgejoMembership{Spec: forgev1.MembershipSpec{
+		CommonSpec:   forgev1.CommonSpec{ProviderRef: "default"},
+		Organization: "jakeschurch", Username: "argo-workflows", Teams: []string{"flake-readers"},
+	}}
+	reconciler := managedReconciler{}
+	if _, err := reconciler.reconcile(context.Background(), api, object); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(requests, ",")
+	if strings.Contains(got, "/orgs/jakeschurch/members/argo-workflows") ||
+		!strings.Contains(got, "PUT /api/v1/teams/9/members/argo-workflows") {
+		t.Fatalf("unexpected membership requests: %s", got)
 	}
 }
 

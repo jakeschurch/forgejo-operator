@@ -231,8 +231,10 @@ func (r *managedReconciler) reconcile(ctx context.Context, api *forgeapi.Client,
 		}
 		return strconv.FormatInt(id, 10), nil
 	case *forgev1.ForgejoMembership:
-		if err := api.Do(ctx, http.MethodPut, "orgs/"+esc(v.Spec.Organization)+"/members/"+esc(v.Spec.Username), nil, nil); err != nil {
-			return "", err
+		if len(v.Spec.Teams) == 0 {
+			if err := api.Do(ctx, http.MethodGet, "orgs/"+esc(v.Spec.Organization)+"/members/"+esc(v.Spec.Username), nil, nil); err != nil {
+				return "", fmt.Errorf("membership requires an existing organization membership or at least one team: %w", err)
+			}
 		}
 		for _, teamName := range v.Spec.Teams {
 			id, err := findTeam(ctx, api, v.Spec.Organization, teamName)
@@ -279,7 +281,8 @@ func (r *managedReconciler) reconcile(ctx context.Context, api *forgeapi.Client,
 			ID   int64  `json:"id"`
 			SHA1 string `json:"sha1"`
 		}
-		if err := api.Do(ctx, http.MethodPost, "users/"+esc(v.Spec.Username)+"/tokens", map[string]any{"name": v.Spec.Name, "scopes": v.Spec.Scopes}, &created); err != nil {
+		path := "users/" + esc(v.Spec.Username) + "/tokens?sudo=" + url.QueryEscape(v.Spec.Username)
+		if err := api.Do(ctx, http.MethodPost, path, map[string]any{"name": v.Spec.Name, "scopes": v.Spec.Scopes}, &created); err != nil {
 			return "", err
 		}
 		secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: v.Namespace, Annotations: map[string]string{credentials.RotationNonceAnnotation: v.Spec.RotationNonce}}, Type: corev1.SecretTypeOpaque, Data: map[string][]byte{"token": []byte(created.SHA1)}}

@@ -19,6 +19,13 @@ spec:
             cidr: {{ .Values.networkPolicy.apiServerCIDR }}
       ports:
         - { protocol: TCP, port: {{ .Values.networkPolicy.apiServerPort }} }
+{{- if .Values.networkPolicy.apiServerEndpointCIDR }}
+    - to:
+        - ipBlock:
+            cidr: {{ .Values.networkPolicy.apiServerEndpointCIDR }}
+      ports:
+        - { protocol: TCP, port: {{ .Values.networkPolicy.apiServerEndpointPort }} }
+{{- end }}
     - to:
         - namespaceSelector:
             matchLabels:

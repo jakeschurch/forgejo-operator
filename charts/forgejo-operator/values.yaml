@@ -15,6 +15,9 @@ networkPolicy:
   forgejoPort: 3000
   apiServerCIDR: 10.43.0.1/32
   apiServerPort: 443
+  # Some CNIs enforce policy both before and after Kubernetes Service DNAT.
+  apiServerEndpointCIDR: ""
+  apiServerEndpointPort: 6443
 metrics:
   secure: true
   port: 8443

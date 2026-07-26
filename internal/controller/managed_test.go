@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -140,6 +141,48 @@ func TestReferencedDeployKeyNeverAppearsInError(t *testing.T) {
 	_, err := reconciler.reconcile(context.Background(), api, object)
 	if err == nil || strings.Contains(err.Error(), publicKey) {
 		t.Fatalf("error leaks credential: %v", err)
+	}
+}
+
+func TestWebhookConfiguresBearerAuthorizationOnAdoption(t *testing.T) {
+	const webhookSecret = "sensitive-webhook-secret"
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = forgev1.AddToScheme(scheme)
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "webhook", Namespace: "forgejo"},
+		Data:       map[string][]byte{"secret": []byte(webhookSecret)},
+	}).Build()
+	var method string
+	var payload struct {
+		Config map[string]string `json:"config"`
+	}
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodGet {
+			return response(http.StatusOK, `[{"id":4,"config":{"url":"http://events.invalid"}}]`), nil
+		}
+		method = r.Method
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			return nil, err
+		}
+		return response(http.StatusNoContent, ""), nil
+	})
+	api, _ := forgeapi.New("https://forgejo.invalid", "admin", forgeapi.WithHTTPClient(&http.Client{Transport: transport}), forgeapi.WithRetries(0))
+	object := &forgev1.ForgejoWebhook{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "forgejo"},
+		Spec: forgev1.WebhookSpec{
+			CommonSpec: forgev1.CommonSpec{ProviderRef: "default"},
+			Owner:      "jakeschurch", Repository: "harbor-operator", URL: "http://events.invalid",
+			SecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "webhook"}, Key: "secret"},
+		},
+	}
+	reconciler := managedReconciler{Reconciler: Reconciler{Client: kube}}
+	id, err := reconciler.reconcile(context.Background(), api, object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "4" || method != http.MethodPatch || payload.Config["authorization_header"] != "Bearer "+webhookSecret {
+		t.Fatalf("webhook adoption did not configure bearer authorization: id=%q method=%s configured=%t", id, method, payload.Config["authorization_header"] != "")
 	}
 }
 

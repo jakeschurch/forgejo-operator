@@ -379,7 +379,17 @@ func (r *managedReconciler) reconcile(ctx context.Context, api *forgeapi.Client,
 		if v.Spec.Active != nil {
 			active = *v.Spec.Active
 		}
-		payload := map[string]any{"type": "forgejo", "active": active, "events": v.Spec.Events, "config": map[string]string{"url": v.Spec.URL, "content_type": "json", "secret": secret}}
+		payload := map[string]any{
+			"type":   "forgejo",
+			"active": active,
+			"events": v.Spec.Events,
+			"config": map[string]string{
+				"url":                  v.Spec.URL,
+				"content_type":         "json",
+				"secret":               secret,
+				"authorization_header": "Bearer " + secret,
+			},
+		}
 		for _, hook := range hooks {
 			if hook.Config["url"] == v.Spec.URL {
 				return strconv.FormatInt(hook.ID, 10), api.Do(ctx, http.MethodPatch, path+"/"+strconv.FormatInt(hook.ID, 10), payload, nil)

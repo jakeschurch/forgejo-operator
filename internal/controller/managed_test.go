@@ -155,7 +155,8 @@ func TestWebhookConfiguresBearerAuthorizationOnAdoption(t *testing.T) {
 	}).Build()
 	var method string
 	var payload struct {
-		Config map[string]string `json:"config"`
+		AuthorizationHeader string            `json:"authorization_header"`
+		Config              map[string]string `json:"config"`
 	}
 	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.Method == http.MethodGet {
@@ -181,8 +182,11 @@ func TestWebhookConfiguresBearerAuthorizationOnAdoption(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if id != "4" || method != http.MethodPatch || payload.Config["authorization_header"] != "Bearer "+webhookSecret {
-		t.Fatalf("webhook adoption did not configure bearer authorization: id=%q method=%s configured=%t", id, method, payload.Config["authorization_header"] != "")
+	if id != "4" || method != http.MethodPatch || payload.AuthorizationHeader != "Bearer "+webhookSecret {
+		t.Fatalf("webhook adoption did not configure bearer authorization: id=%q method=%s configured=%t", id, method, payload.AuthorizationHeader != "")
+	}
+	if _, misplaced := payload.Config["authorization_header"]; misplaced {
+		t.Fatal("webhook authorization header was misplaced in config")
 	}
 }
 

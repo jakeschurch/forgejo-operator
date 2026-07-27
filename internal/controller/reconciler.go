@@ -336,7 +336,16 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				if object.Spec.Description != "" {
 					payload["description"] = object.Spec.Description
 				}
+				// Owner may be an organization or a user. Orgs create via
+				// /orgs/{owner}/repos; a user needs the admin create-for-user
+				// endpoint. The operator token is a site admin, so try the org
+				// path and fall back to the admin path when the owner isn't an
+				// org (404) — supporting user-owned repos, not just orgs.
 				err = api.Do(ctx, http.MethodPost, "orgs/"+object.Spec.Owner+"/repos", payload, &remote)
+				var apiErr *forgeapi.APIError
+				if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+					err = api.Do(ctx, http.MethodPost, "admin/users/"+object.Spec.Owner+"/repos", payload, &remote)
+				}
 			}
 		} else if err == nil {
 			payload := repositoryPatch(object.Spec)

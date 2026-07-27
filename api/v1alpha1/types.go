@@ -15,6 +15,11 @@ const (
 type CommonSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	ProviderRef string `json:"providerRef"`
+	// providerNamespace is where the referenced ForgejoProvider (and its token
+	// Secret) lives. Empty means this resource's own namespace (backward
+	// compatible); set it to reference a provider shared from another namespace.
+	// +optional
+	ProviderNamespace string `json:"providerNamespace,omitempty"`
 	// +kubebuilder:default=Orphan
 	// +kubebuilder:validation:Enum=Orphan;Delete
 	DeletionPolicy DeletionPolicy `json:"deletionPolicy,omitempty"`

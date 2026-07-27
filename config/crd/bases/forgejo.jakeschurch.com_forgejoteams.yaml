@@ -53,6 +53,12 @@ spec:
                 type: string
               permission:
                 type: string
+              providerNamespace:
+                description: |-
+                  providerNamespace is where the referenced ForgejoProvider (and its token
+                  Secret) lives. Empty means this resource's own namespace (backward
+                  compatible); set it to reference a provider shared from another namespace.
+                type: string
               providerRef:
                 minLength: 1
                 type: string

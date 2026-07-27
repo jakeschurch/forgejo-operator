@@ -171,6 +171,15 @@ func (r *Reconciler) providerClient(ctx context.Context, namespace, name string)
 	return forgeapi.New(provider.Spec.URL, string(token), forgeapi.WithHTTPClient(&http.Client{Timeout: timeout}))
 }
 
+// providerNS resolves the namespace of a resource's ForgejoProvider: the
+// explicit spec.providerNamespace if set, else the resource's own namespace.
+func providerNS(objNamespace string, c forgev1.CommonSpec) string {
+	if c.ProviderNamespace != "" {
+		return c.ProviderNamespace
+	}
+	return objNamespace
+}
+
 type ProviderReconciler struct{ Reconciler }
 
 func (r *ProviderReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -202,7 +211,7 @@ func (r *OrganizationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err := r.Get(ctx, req.NamespacedName, &object); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	api, err := r.providerClient(ctx, object.Namespace, object.Spec.ProviderRef)
+	api, err := r.providerClient(ctx, providerNS(object.Namespace, object.Spec.CommonSpec), object.Spec.ProviderRef)
 	if err == nil {
 		err = r.ensureUniqueOwner(ctx, &object)
 	}
@@ -273,7 +282,7 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err := r.Get(ctx, req.NamespacedName, &object); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	api, err := r.providerClient(ctx, object.Namespace, object.Spec.ProviderRef)
+	api, err := r.providerClient(ctx, providerNS(object.Namespace, object.Spec.CommonSpec), object.Spec.ProviderRef)
 	if err == nil {
 		err = r.ensureUniqueOwner(ctx, &object)
 	}

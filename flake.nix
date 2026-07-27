@@ -13,7 +13,7 @@
             pname = "forgejo-operator";
             version = "0.1.0";
             src = self;
-            vendorHash = "sha256-onlkkR5+tdwqCMcxMAzydUjxtGgH3d3HTUQYB8IJzjI=";
+            vendorHash = "sha256-UZsq4EMc5bM3b42zRim/7IrM0DwapPblsNA3MpL3lV0=";
             subPackages = [ "cmd/manager" ];
             ldflags = [ "-s" "-w" ];
             env.CGO_ENABLED = "0";

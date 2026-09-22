@@ -584,15 +584,37 @@ func (r *managedReconciler) putDeployKeyState(v *forgev1.ForgejoDeployKey, entry
 	r.deployKeys[deployKeyStateKey(v)] = entry
 }
 
+func deployKeyBudgetExhausted(entry deployKeyState) error {
+	return fmt.Errorf("deploy key was recreated %d times for generation %d without converging; refusing to delete the live key again", entry.recreates, entry.generation)
+}
+
+// checkDeployKeyRecreateBudget refuses a delete-and-recreate whose budget this
+// generation has already burned. It is consulted before the DELETE, so an
+// exhausted budget leaves the live credential untouched rather than deleting a
+// key it has already decided not to replace.
+func (r *managedReconciler) checkDeployKeyRecreateBudget(v *forgev1.ForgejoDeployKey) error {
+	r.deployKeysMu.Lock()
+	defer r.deployKeysMu.Unlock()
+	entry := r.deployKeyState(v)
+	r.putDeployKeyState(v, entry)
+	if entry.recreates >= maxDeployKeyRecreates {
+		return deployKeyBudgetExhausted(entry)
+	}
+	return nil
+}
+
 // chargeDeployKeyRecreate accounts for one delete-and-recreate of the live
-// credential, refusing once this generation has burned its budget.
+// credential, refusing once this generation has burned its budget. It is only
+// called once the DELETE has actually landed: the loop this budget bounds always
+// deletes, so charging a DELETE that failed would let a transient 5xx or a
+// momentary 403 permanently wedge a resource whose live key is still intact.
 func (r *managedReconciler) chargeDeployKeyRecreate(v *forgev1.ForgejoDeployKey) error {
 	r.deployKeysMu.Lock()
 	defer r.deployKeysMu.Unlock()
 	entry := r.deployKeyState(v)
 	if entry.recreates >= maxDeployKeyRecreates {
 		r.putDeployKeyState(v, entry)
-		return fmt.Errorf("deploy key was recreated %d times for generation %d without converging; refusing to delete the live key again", entry.recreates, entry.generation)
+		return deployKeyBudgetExhausted(entry)
 	}
 	entry.recreates++
 	r.putDeployKeyState(v, entry)
@@ -693,11 +715,16 @@ func (r *managedReconciler) reconcileDeployKey(ctx context.Context, api *forgeap
 		r.forgetDeployKey(v)
 		return strconv.FormatInt(remote.ID, 10), nil
 	}
-	if err := r.chargeDeployKeyRecreate(v); err != nil {
+	if err := r.checkDeployKeyRecreateBudget(v); err != nil {
 		return "", err
 	}
 	path := base + "/" + strconv.FormatInt(remote.ID, 10)
 	if err := api.Do(ctx, http.MethodDelete, path, nil, nil); err != nil && !isNotFound(err) {
+		// Nothing was deleted, so nothing is charged: the live key still works
+		// and the next reconcile gets its full budget back.
+		return "", err
+	}
+	if err := r.chargeDeployKeyRecreate(v); err != nil {
 		return "", err
 	}
 	return r.recreateDeployKey(ctx, api, base, v, key)

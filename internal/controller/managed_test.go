@@ -714,3 +714,50 @@ func TestDeployKeyUnparsableKeyShapeStillCreates(t *testing.T) {
 		t.Fatalf("id=%q posted=%#v", id, posted)
 	}
 }
+
+// Defect 6: a DELETE that fails must not burn the recreate budget. The live key
+// is untouched, so charging a failed DELETE lets a run of transient 5xx wedge a
+// perfectly healthy resource for the rest of its generation.
+func TestDeployKeyFailedDeleteDoesNotBurnRecreateBudget(t *testing.T) {
+	object, kube := deployKeyFixture(false, "42")
+	deleteFails := true
+	deletes, posts := 0, 0
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/keys/42"):
+			return response(http.StatusOK, `{"id":42,"title":"argocd","key":"`+deployKeyPublic+`","read_only":true}`), nil
+		case r.Method == http.MethodDelete:
+			deletes++
+			if deleteFails {
+				return response(http.StatusServiceUnavailable, ""), nil
+			}
+			return response(http.StatusNoContent, ""), nil
+		case r.Method == http.MethodPost:
+			posts++
+			return response(http.StatusCreated, `{"id":74}`), nil
+		}
+		return response(http.StatusOK, `[]`), nil
+	})
+	api, _ := forgeapi.New("https://forgejo.invalid", "admin", forgeapi.WithHTTPClient(&http.Client{Transport: transport}), forgeapi.WithRetries(0))
+	reconciler := managedReconciler{Reconciler: Reconciler{Client: kube}}
+
+	// More failing reconciles than the budget allows.
+	for i := 0; i < maxDeployKeyRecreates+2; i++ {
+		if _, err := reconciler.reconcile(context.Background(), api, object); err == nil {
+			t.Fatalf("a failed DELETE reported success on attempt %d", i)
+		}
+	}
+	if posts != 0 {
+		t.Fatalf("a key was created without its predecessor being deleted (posts=%d)", posts)
+	}
+
+	// Forgejo recovers: the recreate must still be allowed to proceed.
+	deleteFails = false
+	id, err := reconciler.reconcile(context.Background(), api, object)
+	if err != nil {
+		t.Fatalf("transient DELETE failures permanently exhausted the recreate budget: %v", err)
+	}
+	if id != "74" || posts != 1 {
+		t.Fatalf("id=%q posts=%d deletes=%d, want the recovered recreate to land", id, posts, deletes)
+	}
+}

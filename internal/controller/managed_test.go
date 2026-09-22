@@ -220,3 +220,198 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { retu
 func response(status int, body string) *http.Response {
 	return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}
 }
+
+const (
+	deployKeyPublic = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g argocd@homelab"
+	deployKeyOther  = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMjJysvMzc7P0NHS09TV1tfY2drb3N3e3+Dh4uPk5ebn someone-else"
+)
+
+// deployKeyFixture builds a ForgejoDeployKey plus a kube client holding the
+// referenced public key Secret.
+func deployKeyFixture(readOnly bool, remoteID string) (*forgev1.ForgejoDeployKey, client.Client) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = forgev1.AddToScheme(scheme)
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "key", Namespace: "forgejo"},
+		Data:       map[string][]byte{"publicKey": []byte(deployKeyPublic)},
+	}).Build()
+	object := &forgev1.ForgejoDeployKey{
+		ObjectMeta: metav1.ObjectMeta{Name: "foundrybox-argocd-readonly", Namespace: "forgejo"},
+		Spec: forgev1.DeployKeySpec{
+			CommonSpec: forgev1.CommonSpec{ProviderRef: "default"},
+			Owner:      "foundry-labs", Repository: "foundrybox", Title: "argocd", ReadOnly: readOnly,
+			PublicKeySecretRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "key"}, Key: "publicKey"},
+		},
+		Status: forgev1.CommonStatus{RemoteID: remoteID},
+	}
+	return object, kube
+}
+
+func TestDeployKeyReadOnlyChangeRecreatesRemote(t *testing.T) {
+	object, kube := deployKeyFixture(false, "42")
+	var requests []string
+	var created map[string]any
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/keys/42"):
+			return response(http.StatusOK, `{"id":42,"title":"argocd","key":"`+deployKeyPublic+`","read_only":true}`), nil
+		case r.Method == http.MethodDelete:
+			return response(http.StatusNoContent, ""), nil
+		case r.Method == http.MethodPost:
+			if err := json.NewDecoder(r.Body).Decode(&created); err != nil {
+				return nil, err
+			}
+			return response(http.StatusCreated, `{"id":74}`), nil
+		}
+		return response(http.StatusOK, `[]`), nil
+	})
+	api, _ := forgeapi.New("https://forgejo.invalid", "admin", forgeapi.WithHTTPClient(&http.Client{Transport: transport}), forgeapi.WithRetries(0))
+	reconciler := managedReconciler{Reconciler: Reconciler{Client: kube}}
+	id, err := reconciler.reconcile(context.Background(), api, object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(requests, ",")
+	if !strings.Contains(got, "DELETE /api/v1/repos/foundry-labs/foundrybox/keys/42") ||
+		!strings.Contains(got, "POST /api/v1/repos/foundry-labs/foundrybox/keys") {
+		t.Fatalf("readOnly change did not recreate the remote key: %s", got)
+	}
+	if created["read_only"] != false || created["title"] != "argocd" {
+		t.Fatalf("recreated key did not carry the declared state: %#v", created)
+	}
+	if id != "74" {
+		t.Fatalf("status.remoteID was not advanced to the new key: %q", id)
+	}
+}
+
+func TestDeployKeyRecreateFailureReportsDegraded(t *testing.T) {
+	object, kube := deployKeyFixture(false, "42")
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/keys/42"):
+			return response(http.StatusOK, `{"id":42,"title":"argocd","key":"`+deployKeyPublic+`","read_only":true}`), nil
+		case r.Method == http.MethodDelete:
+			return response(http.StatusNoContent, ""), nil
+		case r.Method == http.MethodPost:
+			return response(http.StatusUnprocessableEntity, `{"message":"Key content has been used as non-deploy key"}`), nil
+		}
+		return response(http.StatusOK, `[]`), nil
+	})
+	api, _ := forgeapi.New("https://forgejo.invalid", "admin", forgeapi.WithHTTPClient(&http.Client{Transport: transport}), forgeapi.WithRetries(0))
+	reconciler := managedReconciler{Reconciler: Reconciler{Client: kube}}
+	id, err := reconciler.reconcile(context.Background(), api, object)
+	if err == nil {
+		t.Fatal("failed recreate reported success")
+	}
+	if id != "" {
+		t.Fatalf("failed recreate returned a remote id: %q", id)
+	}
+	if strings.Contains(err.Error(), deployKeyPublic) {
+		t.Fatalf("error leaks credential: %v", err)
+	}
+	setStatus(&object.Status, object.Generation, err)
+	for _, condition := range object.Status.Conditions {
+		want := metav1.ConditionFalse
+		if condition.Type == "Degraded" {
+			want = metav1.ConditionTrue
+		}
+		if condition.Status != want {
+			t.Fatalf("condition %s is %s, want %s", condition.Type, condition.Status, want)
+		}
+	}
+}
+
+func TestDeployKeyAdoptsKeyMatchingDeclaredState(t *testing.T) {
+	object, kube := deployKeyFixture(false, "42")
+	var requests []string
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/keys/42"):
+			return response(http.StatusNotFound, `{"message":"not found"}`), nil
+		case strings.HasSuffix(r.URL.Path, "/keys/74"):
+			return response(http.StatusOK, `{"id":74,"title":"argocd","key":"`+deployKeyPublic+`","read_only":false}`), nil
+		case r.Method == http.MethodGet:
+			return response(http.StatusOK, `[{"id":9,"title":"unrelated","key":"`+deployKeyOther+`"},{"id":74,"title":"argocd","key":"`+deployKeyPublic+`"}]`), nil
+		}
+		return response(http.StatusCreated, `{"id":99}`), nil
+	})
+	api, _ := forgeapi.New("https://forgejo.invalid", "admin", forgeapi.WithHTTPClient(&http.Client{Transport: transport}), forgeapi.WithRetries(0))
+	reconciler := managedReconciler{Reconciler: Reconciler{Client: kube}}
+	id, err := reconciler.reconcile(context.Background(), api, object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "74" {
+		t.Fatalf("stale remoteID was not repaired by adoption: %q", id)
+	}
+	got := strings.Join(requests, ",")
+	if strings.Contains(got, "DELETE") || strings.Contains(got, "POST") {
+		t.Fatalf("adoption of a matching key mutated the remote: %s", got)
+	}
+}
+
+func TestDeployKeyFingerprintMismatchIsNeverDeleted(t *testing.T) {
+	object, kube := deployKeyFixture(false, "42")
+	var requests []string
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		if strings.HasSuffix(r.URL.Path, "/keys/42") {
+			return response(http.StatusOK, `{"id":42,"title":"argocd","key":"`+deployKeyOther+`","read_only":true}`), nil
+		}
+		return response(http.StatusOK, `[]`), nil
+	})
+	api, _ := forgeapi.New("https://forgejo.invalid", "admin", forgeapi.WithHTTPClient(&http.Client{Transport: transport}), forgeapi.WithRetries(0))
+	reconciler := managedReconciler{Reconciler: Reconciler{Client: kube}}
+	if _, err := reconciler.reconcile(context.Background(), api, object); err == nil {
+		t.Fatal("foreign deploy key reported as reconciled")
+	}
+	if got := strings.Join(requests, ","); strings.Contains(got, "DELETE") {
+		t.Fatalf("foreign deploy key was deleted: %s", got)
+	}
+}
+
+func TestDeployKeyStaleRemoteIDAdoptsByFingerprint(t *testing.T) {
+	object, kube := deployKeyFixture(false, "42")
+	var requests []string
+	var created map[string]any
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/keys/42"):
+			return response(http.StatusNotFound, `{"message":"not found"}`), nil
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/keys/74"):
+			return response(http.StatusOK, `{"id":74,"title":"argocd-old","key":"`+deployKeyPublic+`","read_only":false}`), nil
+		case r.Method == http.MethodGet:
+			// Nothing carries the declared title: only the fingerprint can
+			// locate the key this resource manages.
+			return response(http.StatusOK, `[{"id":9,"title":"unrelated","key":"`+deployKeyOther+`"},{"id":74,"title":"argocd-old","key":"`+deployKeyPublic+`"}]`), nil
+		case r.Method == http.MethodDelete:
+			return response(http.StatusNoContent, ""), nil
+		}
+		if err := json.NewDecoder(r.Body).Decode(&created); err != nil {
+			return nil, err
+		}
+		return response(http.StatusCreated, `{"id":81}`), nil
+	})
+	api, _ := forgeapi.New("https://forgejo.invalid", "admin", forgeapi.WithHTTPClient(&http.Client{Transport: transport}), forgeapi.WithRetries(0))
+	reconciler := managedReconciler{Reconciler: Reconciler{Client: kube}}
+	id, err := reconciler.reconcile(context.Background(), api, object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(requests, ",")
+	if !strings.Contains(got, "GET /api/v1/repos/foundry-labs/foundrybox/keys/42") {
+		t.Fatalf("recorded remoteID was never probed: %s", got)
+	}
+	if !strings.Contains(got, "DELETE /api/v1/repos/foundry-labs/foundrybox/keys/74") ||
+		strings.Contains(got, "DELETE /api/v1/repos/foundry-labs/foundrybox/keys/9") ||
+		strings.Contains(got, "DELETE /api/v1/repos/foundry-labs/foundrybox/keys/42") {
+		t.Fatalf("fingerprint adoption deleted the wrong key: %s", got)
+	}
+	if created["title"] != "argocd" || created["read_only"] != false || id != "81" {
+		t.Fatalf("adopted key was not converged: payload=%#v id=%q", created, id)
+	}
+}

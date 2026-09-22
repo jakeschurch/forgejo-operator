@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -322,32 +324,7 @@ func (r *managedReconciler) reconcile(ctx context.Context, api *forgeapi.Client,
 		path := repoPath(v.Spec.Owner, v.Spec.Repository) + "/collaborators/" + esc(v.Spec.Username)
 		return v.Spec.Username, api.Do(ctx, http.MethodPut, path, map[string]any{"permission": v.Spec.Permission}, nil)
 	case *forgev1.ForgejoDeployKey:
-		key, err := r.secretValue(ctx, v.Namespace, v.Spec.PublicKeySecretRef, "publicKey")
-		if err != nil {
-			return "", err
-		}
-		path := repoPath(v.Spec.Owner, v.Spec.Repository) + "/keys"
-		var keys []struct {
-			ID    int64  `json:"id"`
-			Title string `json:"title"`
-			Key   string `json:"key"`
-		}
-		if err := api.Do(ctx, http.MethodGet, path, nil, &keys); err != nil {
-			return "", err
-		}
-		for _, remote := range keys {
-			if remote.Title == v.Spec.Title {
-				if strings.TrimSpace(remote.Key) != strings.TrimSpace(key) {
-					return "", errors.New("adopted deploy key differs; rotate with a new title")
-				}
-				return strconv.FormatInt(remote.ID, 10), nil
-			}
-		}
-		var created struct {
-			ID int64 `json:"id"`
-		}
-		err = api.Do(ctx, http.MethodPost, path, map[string]any{"title": v.Spec.Title, "key": key, "read_only": v.Spec.ReadOnly}, &created)
-		return strconv.FormatInt(created.ID, 10), err
+		return r.reconcileDeployKey(ctx, api, v)
 	case *forgev1.ForgejoWebhook:
 		secret := ""
 		if v.Spec.SecretRef != nil {
@@ -513,6 +490,125 @@ func (r *managedReconciler) deleteRemote(ctx context.Context, api *forgeapi.Clie
 		return nil
 	}
 	return err
+}
+
+// remoteDeployKey is the authoritative Forgejo representation of a deploy key.
+// Only GET .../keys/{id} is trusted for read_only and title; the repository
+// listing is used solely to locate an id.
+type remoteDeployKey struct {
+	ID       int64  `json:"id"`
+	Title    string `json:"title"`
+	Key      string `json:"key"`
+	ReadOnly bool   `json:"read_only"`
+}
+
+// reconcileDeployKey converges a deploy key. Forgejo deploy keys are immutable:
+// the API offers POST, GET and DELETE but no PATCH for read_only or title, so a
+// divergent key is deleted and recreated instead of being declared in sync. The
+// remote key is only ever deleted once its public key fingerprint matches the
+// one this resource declares.
+func (r *managedReconciler) reconcileDeployKey(ctx context.Context, api *forgeapi.Client, v *forgev1.ForgejoDeployKey) (string, error) {
+	key, err := r.secretValue(ctx, v.Namespace, v.Spec.PublicKeySecretRef, "publicKey")
+	if err != nil {
+		return "", err
+	}
+	want := sshFingerprint(key)
+	if want == "" {
+		return "", errors.New("declared deploy key is not a usable SSH public key")
+	}
+	base := repoPath(v.Spec.Owner, v.Spec.Repository) + "/keys"
+
+	var remote remoteDeployKey
+	found := false
+	// The recorded id is authoritative when it still resolves. A stale id (the
+	// key was deleted or replaced out of band) falls through to the listing.
+	if v.Status.RemoteID != "" {
+		if recorded, parseErr := strconv.ParseInt(v.Status.RemoteID, 10, 64); parseErr == nil && recorded > 0 {
+			err := api.Do(ctx, http.MethodGet, base+"/"+strconv.FormatInt(recorded, 10), nil, &remote)
+			switch {
+			case err == nil:
+				found = true
+			case isNotFound(err):
+			default:
+				return "", err
+			}
+		}
+	}
+	if !found {
+		var keys []remoteDeployKey
+		if err := api.Do(ctx, http.MethodGet, base+"?limit=100", nil, &keys); err != nil {
+			return "", err
+		}
+		var id int64
+		for _, candidate := range keys {
+			if candidate.Title == v.Spec.Title {
+				id = candidate.ID
+				break
+			}
+		}
+		if id == 0 {
+			// Adopt by fingerprint so a key recreated by hand, or one whose
+			// title changed, is reclaimed instead of duplicated.
+			for _, candidate := range keys {
+				if sshFingerprint(candidate.Key) == want {
+					id = candidate.ID
+					break
+				}
+			}
+		}
+		if id != 0 {
+			err := api.Do(ctx, http.MethodGet, base+"/"+strconv.FormatInt(id, 10), nil, &remote)
+			switch {
+			case err == nil:
+				found = true
+			case isNotFound(err):
+			default:
+				return "", err
+			}
+		}
+	}
+	if !found {
+		return createDeployKey(ctx, api, base, v, key)
+	}
+	if sshFingerprint(remote.Key) != want {
+		return "", errors.New("adopted deploy key differs; rotate with a new title")
+	}
+	if remote.Title == v.Spec.Title && remote.ReadOnly == v.Spec.ReadOnly {
+		return strconv.FormatInt(remote.ID, 10), nil
+	}
+	path := base + "/" + strconv.FormatInt(remote.ID, 10)
+	if err := api.Do(ctx, http.MethodDelete, path, nil, nil); err != nil && !isNotFound(err) {
+		return "", err
+	}
+	return createDeployKey(ctx, api, base, v, key)
+}
+
+func createDeployKey(ctx context.Context, api *forgeapi.Client, base string, v *forgev1.ForgejoDeployKey, key string) (string, error) {
+	var created struct {
+		ID int64 `json:"id"`
+	}
+	payload := map[string]any{"title": v.Spec.Title, "key": key, "read_only": v.Spec.ReadOnly}
+	if err := api.Do(ctx, http.MethodPost, base, payload, &created); err != nil {
+		return "", err
+	}
+	return strconv.FormatInt(created.ID, 10), nil
+}
+
+// sshFingerprint returns the SHA-256 fingerprint of an SSH public key's wire
+// format, ignoring any trailing comment. It returns "" when the key cannot be
+// parsed; callers must treat that as "never touch the remote key". The key
+// material itself is never returned or logged.
+func sshFingerprint(key string) string {
+	fields := strings.Fields(strings.TrimSpace(key))
+	if len(fields) < 2 {
+		return ""
+	}
+	blob, err := base64.StdEncoding.DecodeString(fields[1])
+	if err != nil || len(blob) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(blob)
+	return base64.RawStdEncoding.EncodeToString(sum[:])
 }
 
 func findTeam(ctx context.Context, api *forgeapi.Client, org, name string) (int64, error) {

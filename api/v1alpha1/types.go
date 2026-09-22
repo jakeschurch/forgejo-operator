@@ -184,6 +184,27 @@ type PushMirrorSpec struct {
 	Interval             string                   `json:"interval,omitempty"`
 	SyncOnCommit         bool                     `json:"syncOnCommit,omitempty"`
 	CredentialsSecretRef corev1.SecretKeySelector `json:"credentialsSecretRef"`
+	// RemoteUsername is the basic-auth username Forgejo stores alongside the
+	// credential. Leaving it empty makes Forgejo store the remote as
+	// "https://:TOKEN@host/...", and GitHub rejects empty-username basic auth:
+	// it falls back to anonymous, and a private repository then answers
+	// "Repository not found", which git surfaces as "Authentication failed".
+	// For a GitHub personal access token set this to the token itself, or to
+	// any non-empty placeholder such as "x-access-token".
+	//
+	// DANGER: a Forgejo push mirror is `git push --mirror`. It makes the
+	// destination IDENTICAL to the source, DELETING every ref the source
+	// lacks. On 2026-09-22 this exact fix was applied by hand to jake/homelab
+	// and the first sync DELETED 162 refs from github.com/jakeschurch/homelab
+	// (82 branches + 80 tags); they had to be restored from a local clone.
+	// Setting this field on a mirror that has never authenticated successfully
+	// is what ARMS that first destructive sync. Reconcile the source's refs
+	// with the destination's BEFORE this value reaches a live mirror.
+	//
+	// This is applied only when the mirror is CREATED. The operator never
+	// rewrites an existing mirror's credentials; see reconcile() for why.
+	// +optional
+	RemoteUsername string `json:"remoteUsername,omitempty"`
 }
 
 // +kubebuilder:validation:XValidation:rule="self.providerRef == oldSelf.providerRef && self.owner == oldSelf.owner && self.repository == oldSelf.repository && self.branch == oldSelf.branch",message="remote identity fields are immutable"

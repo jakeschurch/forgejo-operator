@@ -761,3 +761,118 @@ func TestDeployKeyFailedDeleteDoesNotBurnRecreateBudget(t *testing.T) {
 		t.Fatalf("id=%q posts=%d deletes=%d, want the recovered recreate to land", id, posts, deletes)
 	}
 }
+
+// pushMirrorFixture builds a ForgejoPushMirror plus a kube client holding the
+// referenced credential Secret.
+func pushMirrorFixture(remoteUsername string) (*forgev1.ForgejoPushMirror, client.Client) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = forgev1.AddToScheme(scheme)
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "mirror-token", Namespace: "forgejo"},
+		Data:       map[string][]byte{"token": []byte("ghp-sensitive")},
+	}).Build()
+	object := &forgev1.ForgejoPushMirror{
+		ObjectMeta: metav1.ObjectMeta{Name: "homelab-github", Namespace: "forgejo"},
+		Spec: forgev1.PushMirrorSpec{
+			CommonSpec:     forgev1.CommonSpec{ProviderRef: "default"},
+			Owner:          "jake",
+			Repository:     "homelab",
+			DestinationURL: "https://github.com/jakeschurch/homelab.git",
+			Interval:       "8h0m0s",
+			RemoteUsername: remoteUsername,
+		},
+	}
+	object.Spec.CredentialsSecretRef = corev1.SecretKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "mirror-token"}, Key: "token",
+	}
+	return object, kube
+}
+
+// argocd-tag-updater-4mk: a push mirror created without remote_username is
+// stored by Forgejo as "https://:TOKEN@github.com/...". GitHub rejects
+// empty-username basic auth, falls back to anonymous, and a private repository
+// answers "Repository not found" -- surfaced by git as "Authentication failed".
+func TestPushMirrorCreateSendsRemoteUsername(t *testing.T) {
+	object, kube := pushMirrorFixture("x-access-token")
+	var created map[string]any
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPost {
+			if err := json.NewDecoder(r.Body).Decode(&created); err != nil {
+				return nil, err
+			}
+			return response(http.StatusCreated, `{"id":5}`), nil
+		}
+		return response(http.StatusOK, `[]`), nil
+	})
+	api, _ := forgeapi.New("https://forgejo.invalid", "admin", forgeapi.WithHTTPClient(&http.Client{Transport: transport}), forgeapi.WithRetries(0))
+	reconciler := managedReconciler{Reconciler: Reconciler{Client: kube}}
+	id, err := reconciler.reconcile(context.Background(), api, object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "5" {
+		t.Fatalf("id=%q, want 5", id)
+	}
+	if created["remote_username"] != "x-access-token" {
+		t.Fatalf("create payload did not carry remote_username: %#v", created)
+	}
+	if created["remote_password"] != "ghp-sensitive" || created["remote_address"] != "https://github.com/jakeschurch/homelab.git" {
+		t.Fatalf("create payload lost an existing field: %#v", created)
+	}
+}
+
+// An undeclared remoteUsername must leave the wire payload exactly as it was,
+// so existing mirrors are not disturbed by this change.
+func TestPushMirrorCreateOmitsEmptyRemoteUsername(t *testing.T) {
+	object, kube := pushMirrorFixture("")
+	var created map[string]any
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPost {
+			if err := json.NewDecoder(r.Body).Decode(&created); err != nil {
+				return nil, err
+			}
+			return response(http.StatusCreated, `{"id":5}`), nil
+		}
+		return response(http.StatusOK, `[]`), nil
+	})
+	api, _ := forgeapi.New("https://forgejo.invalid", "admin", forgeapi.WithHTTPClient(&http.Client{Transport: transport}), forgeapi.WithRetries(0))
+	reconciler := managedReconciler{Reconciler: Reconciler{Client: kube}}
+	if _, err := reconciler.reconcile(context.Background(), api, object); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := created["remote_username"]; present {
+		t.Fatalf("an undeclared remoteUsername was sent anyway: %#v", created)
+	}
+}
+
+// SAFETY: an existing mirror must be adopted read-only. Rewriting its remote
+// means delete-and-recreate, and a freshly created push mirror syncs --
+// `git push --mirror` deletes every destination ref the source lacks. That is
+// the 2026-09-22 incident in which 162 refs were destroyed on GitHub.
+func TestPushMirrorNeverRewritesExistingMirror(t *testing.T) {
+	object, kube := pushMirrorFixture("x-access-token")
+	var requests []string
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		if r.Method == http.MethodGet {
+			return response(http.StatusOK, `[{"id":5,"remote_address":"https://github.com/jakeschurch/homelab.git"}]`), nil
+		}
+		return response(http.StatusCreated, `{"id":9}`), nil
+	})
+	api, _ := forgeapi.New("https://forgejo.invalid", "admin", forgeapi.WithHTTPClient(&http.Client{Transport: transport}), forgeapi.WithRetries(0))
+	reconciler := managedReconciler{Reconciler: Reconciler{Client: kube}}
+	id, err := reconciler.reconcile(context.Background(), api, object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "5" {
+		t.Fatalf("id=%q, want the adopted mirror 5", id)
+	}
+	for _, request := range requests {
+		if strings.HasPrefix(request, http.MethodPost) || strings.HasPrefix(request, http.MethodPatch) ||
+			strings.HasPrefix(request, http.MethodPut) || strings.HasPrefix(request, http.MethodDelete) {
+			t.Fatalf("an existing push mirror was rewritten, arming a destructive sync: %v", requests)
+		}
+	}
+}

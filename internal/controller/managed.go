@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	forgev1 "github.com/jakeschurch/forgejo-operator/api/v1alpha1"
@@ -27,6 +28,11 @@ import (
 type managedReconciler struct {
 	Reconciler
 	newObject func() client.Object
+	// deployKeys guards the delete-and-recreate path of immutable deploy keys
+	// against an unbounded loop, and remembers a recreate that left a
+	// repository keyless.
+	deployKeysMu sync.Mutex
+	deployKeys   map[string]deployKeyState
 }
 
 func (r *managedReconciler) SetupWithManager(m ctrl.Manager) error {
@@ -58,6 +64,12 @@ func (r *managedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if err == nil && id != "" {
 			status.RemoteID = id
 			status.GeneratedSecrets = generatedSecretRefs(object)
+		}
+		var orphaned *deployKeyOrphanedError
+		if errors.As(err, &orphaned) {
+			// The remote key was deleted and not replaced: stop advertising an
+			// id that no longer resolves.
+			status.RemoteID = ""
 		}
 	} else if err == nil {
 		if contains(object.GetFinalizers(), finalizer) {
@@ -457,6 +469,11 @@ func (r *managedReconciler) reconcile(ctx context.Context, api *forgeapi.Client,
 }
 
 func (r *managedReconciler) deleteRemote(ctx context.Context, api *forgeapi.Client, object client.Object, id string) error {
+	// Without a recorded id there is nothing to address: never aim a DELETE at
+	// a collection endpoint on a guess.
+	if id == "" {
+		return nil
+	}
 	var path string
 	switch v := object.(type) {
 	case *forgev1.ForgejoTeam:
@@ -492,6 +509,39 @@ func (r *managedReconciler) deleteRemote(ctx context.Context, api *forgeapi.Clie
 	return err
 }
 
+// maxDeployKeyRecreates bounds how many times one generation of a deploy key
+// may delete and recreate its live credential before the operator gives up. A
+// server that does not return the declared title verbatim would otherwise
+// recreate a working credential on every single reconcile, forever.
+const maxDeployKeyRecreates = 3
+
+const (
+	// deployKeyCreateAttempts bounds the in-reconcile retry of the POST that
+	// follows a successful DELETE: until it lands the repository has no key.
+	deployKeyCreateAttempts = 3
+	deployKeyRetryBackoff   = 150 * time.Millisecond
+	deployKeyPageSize       = 50
+	// maxDeployKeyPages bounds the listing walk so a server that keeps
+	// returning full pages cannot spin the reconcile forever.
+	maxDeployKeyPages = 100
+)
+
+// errDeployKeyCreatedWithoutID reports a create that Forgejo accepted without
+// returning a usable id. The key may well exist, so this is never retried: a
+// second POST of the same material is rejected as a duplicate.
+var errDeployKeyCreatedWithoutID = errors.New("Forgejo accepted the deploy key without returning an id")
+
+// deployKeyOrphanedError reports the one state this controller cannot repair on
+// its own: the remote key was deleted and the replacement was refused, so the
+// repository currently has no deploy key at all.
+type deployKeyOrphanedError struct{ err error }
+
+func (e *deployKeyOrphanedError) Error() string {
+	return "remote deploy key was deleted and not recreated, the repository has no deploy key: " + e.err.Error()
+}
+func (e *deployKeyOrphanedError) Unwrap() error           { return e.err }
+func (e *deployKeyOrphanedError) ConditionReason() string { return "RemoteKeyDeletedNotRecreated" }
+
 // remoteDeployKey is the authoritative Forgejo representation of a deploy key.
 // Only GET .../keys/{id} is trusted for read_only and title; the repository
 // listing is used solely to locate an id.
@@ -502,20 +552,92 @@ type remoteDeployKey struct {
 	ReadOnly bool   `json:"read_only"`
 }
 
+// deployKeyState tracks, per object generation, how often the live credential
+// has been deleted and recreated and whether a recreate left it orphaned. It is
+// process-local on purpose: it guards against an unbounded loop, which is a
+// within-process concern, and keeps the CRD surface unchanged.
+type deployKeyState struct {
+	generation int64
+	recreates  int
+	orphaned   bool
+}
+
+func deployKeyStateKey(v *forgev1.ForgejoDeployKey) string {
+	if v.UID != "" {
+		return string(v.UID)
+	}
+	return v.Namespace + "/" + v.Name
+}
+
+func (r *managedReconciler) deployKeyState(v *forgev1.ForgejoDeployKey) deployKeyState {
+	entry := r.deployKeys[deployKeyStateKey(v)]
+	if entry.generation != v.Generation {
+		return deployKeyState{generation: v.Generation}
+	}
+	return entry
+}
+
+func (r *managedReconciler) putDeployKeyState(v *forgev1.ForgejoDeployKey, entry deployKeyState) {
+	if r.deployKeys == nil {
+		r.deployKeys = map[string]deployKeyState{}
+	}
+	r.deployKeys[deployKeyStateKey(v)] = entry
+}
+
+// chargeDeployKeyRecreate accounts for one delete-and-recreate of the live
+// credential, refusing once this generation has burned its budget.
+func (r *managedReconciler) chargeDeployKeyRecreate(v *forgev1.ForgejoDeployKey) error {
+	r.deployKeysMu.Lock()
+	defer r.deployKeysMu.Unlock()
+	entry := r.deployKeyState(v)
+	if entry.recreates >= maxDeployKeyRecreates {
+		r.putDeployKeyState(v, entry)
+		return fmt.Errorf("deploy key was recreated %d times for generation %d without converging; refusing to delete the live key again", entry.recreates, entry.generation)
+	}
+	entry.recreates++
+	r.putDeployKeyState(v, entry)
+	return nil
+}
+
+func (r *managedReconciler) markDeployKeyOrphaned(v *forgev1.ForgejoDeployKey, orphaned bool) {
+	r.deployKeysMu.Lock()
+	defer r.deployKeysMu.Unlock()
+	entry := r.deployKeyState(v)
+	entry.orphaned = orphaned
+	r.putDeployKeyState(v, entry)
+}
+
+func (r *managedReconciler) deployKeyOrphaned(v *forgev1.ForgejoDeployKey) bool {
+	r.deployKeysMu.Lock()
+	defer r.deployKeysMu.Unlock()
+	return r.deployKeyState(v).orphaned
+}
+
+func (r *managedReconciler) forgetDeployKey(v *forgev1.ForgejoDeployKey) {
+	r.deployKeysMu.Lock()
+	defer r.deployKeysMu.Unlock()
+	delete(r.deployKeys, deployKeyStateKey(v))
+}
+
 // reconcileDeployKey converges a deploy key. Forgejo deploy keys are immutable:
 // the API offers POST, GET and DELETE but no PATCH for read_only or title, so a
-// divergent key is deleted and recreated instead of being declared in sync. The
-// remote key is only ever deleted once its public key fingerprint matches the
-// one this resource declares.
+// divergent key is deleted and recreated instead of being declared in sync.
+// Create-before-delete is impossible — Forgejo rejects duplicate key content in
+// a repository whatever the title — so the delete comes first and the recovery
+// lives in the error handling: the create is retried while it can still land,
+// and a terminal failure is reported as an explicit keyless outage. The remote
+// key is only ever deleted once its public key matches the one this resource
+// declares.
 func (r *managedReconciler) reconcileDeployKey(ctx context.Context, api *forgeapi.Client, v *forgev1.ForgejoDeployKey) (string, error) {
 	key, err := r.secretValue(ctx, v.Namespace, v.Spec.PublicKeySecretRef, "publicKey")
 	if err != nil {
 		return "", err
 	}
-	want := sshFingerprint(key)
+	want := deployKeyIdentity(key)
 	if want == "" {
-		return "", errors.New("declared deploy key is not a usable SSH public key")
+		return "", errors.New("declared deploy key is empty")
 	}
+	title := normalizeDeployKeyTitle(v.Spec.Title)
 	base := repoPath(v.Spec.Owner, v.Spec.Repository) + "/keys"
 
 	var remote remoteDeployKey
@@ -535,26 +657,9 @@ func (r *managedReconciler) reconcileDeployKey(ctx context.Context, api *forgeap
 		}
 	}
 	if !found {
-		var keys []remoteDeployKey
-		if err := api.Do(ctx, http.MethodGet, base+"?limit=100", nil, &keys); err != nil {
-			return "", err
-		}
-		var id int64
-		for _, candidate := range keys {
-			if candidate.Title == v.Spec.Title {
-				id = candidate.ID
-				break
-			}
-		}
-		if id == 0 {
-			// Adopt by fingerprint so a key recreated by hand, or one whose
-			// title changed, is reclaimed instead of duplicated.
-			for _, candidate := range keys {
-				if sshFingerprint(candidate.Key) == want {
-					id = candidate.ID
-					break
-				}
-			}
+		id, findErr := findDeployKey(ctx, api, base, title, want)
+		if findErr != nil {
+			return "", findErr
 		}
 		if id != 0 {
 			err := api.Do(ctx, http.MethodGet, base+"/"+strconv.FormatInt(id, 10), nil, &remote)
@@ -568,30 +673,170 @@ func (r *managedReconciler) reconcileDeployKey(ctx context.Context, api *forgeap
 		}
 	}
 	if !found {
-		return createDeployKey(ctx, api, base, v, key)
+		id, createErr := createDeployKey(ctx, api, base, v, key)
+		if createErr != nil {
+			// A key this resource used to own is gone and cannot be replaced:
+			// keep reporting the keyless window until a create succeeds.
+			if r.deployKeyOrphaned(v) || v.Status.RemoteID != "" {
+				r.markDeployKeyOrphaned(v, true)
+				return "", &deployKeyOrphanedError{err: createErr}
+			}
+			return "", createErr
+		}
+		r.markDeployKeyOrphaned(v, false)
+		return id, nil
 	}
-	if sshFingerprint(remote.Key) != want {
+	if deployKeyIdentity(remote.Key) != want {
 		return "", errors.New("adopted deploy key differs; rotate with a new title")
 	}
-	if remote.Title == v.Spec.Title && remote.ReadOnly == v.Spec.ReadOnly {
+	if normalizeDeployKeyTitle(remote.Title) == title && remote.ReadOnly == v.Spec.ReadOnly {
+		r.forgetDeployKey(v)
 		return strconv.FormatInt(remote.ID, 10), nil
+	}
+	if err := r.chargeDeployKeyRecreate(v); err != nil {
+		return "", err
 	}
 	path := base + "/" + strconv.FormatInt(remote.ID, 10)
 	if err := api.Do(ctx, http.MethodDelete, path, nil, nil); err != nil && !isNotFound(err) {
 		return "", err
 	}
-	return createDeployKey(ctx, api, base, v, key)
+	return r.recreateDeployKey(ctx, api, base, v, key)
+}
+
+// recreateDeployKey runs the POST that follows a successful DELETE. Until it
+// succeeds the repository has no deploy key, so a failure that could still land
+// is retried here instead of waiting for the next requeue; a failure that never
+// will (Forgejo already holds this key as a user SSH key, say) is reported as an
+// explicit orphan so the keyless window is visible rather than silent.
+func (r *managedReconciler) recreateDeployKey(ctx context.Context, api *forgeapi.Client, base string, v *forgev1.ForgejoDeployKey, key string) (string, error) {
+	var lastErr error
+	for attempt := 0; attempt < deployKeyCreateAttempts; attempt++ {
+		if attempt > 0 {
+			if err := sleep(ctx, time.Duration(attempt)*deployKeyRetryBackoff); err != nil {
+				lastErr = err
+				break
+			}
+		}
+		id, err := createDeployKey(ctx, api, base, v, key)
+		if err == nil {
+			r.markDeployKeyOrphaned(v, false)
+			return id, nil
+		}
+		lastErr = err
+		if !retryableCreateError(err) {
+			break
+		}
+	}
+	// A create whose response was lost still committed server-side, and every
+	// later POST of the same material is refused as a duplicate. Confirm the
+	// repository really has no key before raising the keyless alarm.
+	if id, findErr := findDeployKey(ctx, api, base, normalizeDeployKeyTitle(v.Spec.Title), deployKeyIdentity(key)); findErr == nil && id != 0 {
+		r.markDeployKeyOrphaned(v, false)
+		return strconv.FormatInt(id, 10), nil
+	}
+	r.markDeployKeyOrphaned(v, true)
+	return "", &deployKeyOrphanedError{err: lastErr}
+}
+
+// retryableCreateError reports whether a create could still succeed on a retry.
+// Every 4xx other than 429 is Forgejo's final answer, and a create that returned
+// no id may already have taken effect, so neither is retried.
+func retryableCreateError(err error) bool {
+	if errors.Is(err, errDeployKeyCreatedWithoutID) {
+		return false
+	}
+	var apiErr *forgeapi.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.StatusCode == http.StatusTooManyRequests || apiErr.StatusCode >= 500
+	}
+	return true
+}
+
+func sleep(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// findDeployKey walks the repository key listing, which is paginated and whose
+// page size the server may clamp below the requested limit. A title match wins
+// over a fingerprint match, so the whole listing is scanned before falling back.
+func findDeployKey(ctx context.Context, api *forgeapi.Client, base, title, want string) (int64, error) {
+	var byIdentity int64
+	pageSize, lastFirstID := 0, int64(0)
+	for page := 1; page <= maxDeployKeyPages; page++ {
+		var keys []remoteDeployKey
+		path := base + "?limit=" + strconv.Itoa(deployKeyPageSize) + "&page=" + strconv.Itoa(page)
+		if err := api.Do(ctx, http.MethodGet, path, nil, &keys); err != nil {
+			return 0, err
+		}
+		if len(keys) == 0 {
+			break
+		}
+		// A server that ignores the page parameter repeats the first page
+		// forever; stop rather than walking the page cap every reconcile.
+		if keys[0].ID == lastFirstID {
+			break
+		}
+		lastFirstID = keys[0].ID
+		for _, candidate := range keys {
+			if normalizeDeployKeyTitle(candidate.Title) == title {
+				return candidate.ID, nil
+			}
+			// Adopt by key material so a key recreated by hand, or one whose
+			// title changed, is reclaimed instead of duplicated.
+			if byIdentity == 0 && deployKeyIdentity(candidate.Key) == want {
+				byIdentity = candidate.ID
+			}
+		}
+		if pageSize == 0 {
+			pageSize = len(keys)
+		}
+		if len(keys) < pageSize {
+			break
+		}
+	}
+	return byIdentity, nil
 }
 
 func createDeployKey(ctx context.Context, api *forgeapi.Client, base string, v *forgev1.ForgejoDeployKey, key string) (string, error) {
 	var created struct {
 		ID int64 `json:"id"`
 	}
-	payload := map[string]any{"title": v.Spec.Title, "key": key, "read_only": v.Spec.ReadOnly}
+	payload := map[string]any{"title": normalizeDeployKeyTitle(v.Spec.Title), "key": key, "read_only": v.Spec.ReadOnly}
 	if err := api.Do(ctx, http.MethodPost, base, payload, &created); err != nil {
 		return "", err
 	}
+	if created.ID <= 0 {
+		return "", errDeployKeyCreatedWithoutID
+	}
 	return strconv.FormatInt(created.ID, 10), nil
+}
+
+// normalizeDeployKeyTitle is applied to both the declared and the round-tripped
+// title before they are compared, so surrounding whitespace the server trims is
+// not mistaken for divergence and does not recreate a live credential.
+func normalizeDeployKeyTitle(title string) string { return strings.TrimSpace(title) }
+
+// deployKeyIdentity identifies a public key for comparison. Keys in OpenSSH
+// one-line form are identified by their SHA-256 fingerprint; shapes the wire
+// format parser cannot read (PEM, PKCS#8, RFC4716) fall back to the
+// whitespace-normalised material, which is what this controller compared before
+// fingerprinting existed. Such a key can still be created; it simply never
+// matches a differently encoded remote key, and a mismatch never deletes.
+func deployKeyIdentity(key string) string {
+	if fingerprint := sshFingerprint(key); fingerprint != "" {
+		return "sha256:" + fingerprint
+	}
+	if normalized := strings.Join(strings.Fields(key), " "); normalized != "" {
+		return "raw:" + normalized
+	}
+	return ""
 }
 
 // sshFingerprint returns the SHA-256 fingerprint of an SSH public key's wire

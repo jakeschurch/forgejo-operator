@@ -19,7 +19,12 @@ import (
 
 const finalizer = "forgejo.jakeschurch.com/remote-delete"
 
-type Reconciler struct{ client.Client }
+type Reconciler struct {
+	client.Client
+	// Transport overrides the HTTP transport used for provider clients. It is
+	// a test seam: production leaves it nil and gets the default transport.
+	Transport http.RoundTripper
+}
 
 func (r *Reconciler) ensureUniqueOwner(ctx context.Context, object client.Object) error {
 	list := listFor(object)
@@ -168,7 +173,7 @@ func (r *Reconciler) providerClient(ctx context.Context, namespace, name string)
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
-	return forgeapi.New(provider.Spec.URL, string(token), forgeapi.WithHTTPClient(&http.Client{Timeout: timeout}))
+	return forgeapi.New(provider.Spec.URL, string(token), forgeapi.WithHTTPClient(&http.Client{Timeout: timeout, Transport: r.Transport}))
 }
 
 // providerNS resolves the namespace of a resource's ForgejoProvider: the
@@ -399,6 +404,12 @@ func setStatus(status *forgev1.CommonStatus, generation int64, reconcileErr erro
 	if reconcileErr != nil {
 		ready, synced, degraded = metav1.ConditionFalse, metav1.ConditionFalse, metav1.ConditionTrue
 		reason, message = "ReconcileFailed", reconcileErr.Error()
+		// A failure that names its own condition reason is one an operator has
+		// to act on specifically, not another generic reconcile error.
+		var reasoned interface{ ConditionReason() string }
+		if errors.As(reconcileErr, &reasoned) {
+			reason = reasoned.ConditionReason()
+		}
 	}
 	apimeta.SetStatusCondition(&status.Conditions, metav1.Condition{Type: "Ready", Status: ready, Reason: reason, Message: message, ObservedGeneration: generation})
 	apimeta.SetStatusCondition(&status.Conditions, metav1.Condition{Type: "Synced", Status: synced, Reason: reason, Message: message, ObservedGeneration: generation})

@@ -48,7 +48,7 @@ func (r *managedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if spec == nil {
 		return ctrl.Result{}, errors.New("unsupported managed object")
 	}
-	api, err := r.providerClient(ctx, object.GetNamespace(), spec.ProviderRef)
+	api, err := r.providerClient(ctx, providerNS(object.GetNamespace(), *spec), spec.ProviderRef)
 	if err == nil {
 		err = r.ensureUniqueOwner(ctx, object)
 	}

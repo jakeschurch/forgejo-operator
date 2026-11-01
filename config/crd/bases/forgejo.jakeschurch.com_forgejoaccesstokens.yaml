@@ -37,6 +37,16 @@ spec:
             type: object
           spec:
             properties:
+              accountType:
+                default: Robot
+                description: |-
+                  AccountType Robot mints with the password of a ForgejoRobotAccount in this
+                  namespace. Human is an explicit opt-in to mint for an existing person, and
+                  also requires the username in the provider's humanAccessTokens allowlist.
+                enum:
+                - Robot
+                - Human
+                type: string
               deletionPolicy:
                 default: Orphan
                 enum:
@@ -75,6 +85,9 @@ spec:
             - message: providerRef, username, and name are immutable
               rule: self.providerRef == oldSelf.providerRef && self.username == oldSelf.username
                 && self.name == oldSelf.name
+            - message: accountType is immutable
+              rule: '(has(self.accountType) ? self.accountType : ''Robot'') == (has(oldSelf.accountType)
+                ? oldSelf.accountType : ''Robot'')'
           status:
             properties:
               conditions:

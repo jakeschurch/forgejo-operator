@@ -3,12 +3,14 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
 
 	forgev1 "github.com/jakeschurch/forgejo-operator/api/v1alpha1"
+	"github.com/jakeschurch/forgejo-operator/internal/credentials"
 	forgeapi "github.com/jakeschurch/forgejo-operator/internal/forgejo"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -874,5 +876,291 @@ func TestPushMirrorNeverRewritesExistingMirror(t *testing.T) {
 			strings.HasPrefix(request, http.MethodPut) || strings.HasPrefix(request, http.MethodDelete) {
 			t.Fatalf("an existing push mirror was rewritten, arming a destructive sync: %v", requests)
 		}
+	}
+}
+
+const (
+	humanAdminUser     = "mint-admin"
+	humanAdminPassword = "sensitive-admin-password"
+	humanMintedToken   = "generated-human-token"
+)
+
+func humanProvider(allowed ...string) *forgev1.ForgejoProvider {
+	provider := &forgev1.ForgejoProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "forgejo"},
+		Spec:       forgev1.ForgejoProviderSpec{URL: "https://forgejo.invalid"},
+	}
+	if allowed != nil {
+		provider.Spec.HumanAccessTokens = &forgev1.HumanAccessTokenPolicy{
+			AllowedUsernames:          allowed,
+			AdminCredentialsSecretRef: corev1.LocalObjectReference{Name: "mint-admin"},
+		}
+	}
+	return provider
+}
+
+func humanAdminSecret() *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "mint-admin", Namespace: "forgejo"},
+		Data:       map[string][]byte{"username": []byte(humanAdminUser), "password": []byte(humanAdminPassword)},
+	}
+}
+
+func humanToken(accountType forgev1.AccessTokenAccountType, username string) *forgev1.ForgejoAccessToken {
+	return &forgev1.ForgejoAccessToken{
+		TypeMeta:   metav1.TypeMeta{Kind: "ForgejoAccessToken"},
+		ObjectMeta: metav1.ObjectMeta{Name: "workstation", Namespace: "forgejo"},
+		Spec: forgev1.AccessTokenSpec{
+			CommonSpec:  forgev1.CommonSpec{ProviderRef: "default"},
+			AccountType: accountType,
+			Username:    username, Name: "jake-workstation", Scopes: []string{"write:repository"}, SecretName: "workstation-token",
+		},
+	}
+}
+
+type humanRequest struct {
+	method, path, user string
+	adminAuth          bool
+	body               string
+}
+
+// humanHarness records every request. Every POST mints token id 42.
+func humanHarness(t *testing.T, objects ...client.Object) (*managedReconciler, *forgeapi.Client, *[]humanRequest) {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = forgev1.AddToScheme(scheme)
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+	var requests []humanRequest
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		user, password, _ := r.BasicAuth()
+		var body string
+		if r.Body != nil {
+			raw, _ := io.ReadAll(r.Body)
+			body = string(raw)
+		}
+		requests = append(requests, humanRequest{r.Method, r.URL.Path, user, user == humanAdminUser && password == humanAdminPassword, body})
+		if r.Method == http.MethodDelete {
+			return response(http.StatusNoContent, ""), nil
+		}
+		return response(http.StatusCreated, `{"id":42,"sha1":"`+humanMintedToken+`"}`), nil
+	})
+	api, err := forgeapi.New("https://forgejo.invalid", "admin-api-token", forgeapi.WithHTTPClient(&http.Client{Transport: transport}), forgeapi.WithRetries(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &managedReconciler{Reconciler: Reconciler{Client: kube}}, api, &requests
+}
+
+func TestHumanAccessTokenMintsWithAdminBasicAuth(t *testing.T) {
+	r, api, requests := humanHarness(t, humanProvider("jake"), humanAdminSecret())
+	id, err := r.reconcile(context.Background(), api, humanToken(forgev1.AccessTokenAccountHuman, "jake"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "42" || len(*requests) != 1 {
+		t.Fatalf("id=%q requests=%d", id, len(*requests))
+	}
+	got := (*requests)[0]
+	if got.method != http.MethodPost || got.path != "/api/v1/users/jake/tokens" || !got.adminAuth ||
+		!strings.Contains(got.body, `"name":"jake-workstation"`) || !strings.Contains(got.body, `"write:repository"`) {
+		t.Fatalf("method=%s path=%s user=%s adminAuth=%t", got.method, got.path, got.user, got.adminAuth)
+	}
+	var secret corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "forgejo", Name: "workstation-token"}, &secret); err != nil {
+		t.Fatal(err)
+	}
+	if string(secret.Data["token"]) != humanMintedToken {
+		t.Fatal("generated token was not stored")
+	}
+}
+
+// A human must never be reachable through an account-altering endpoint: the only
+// requests the human path may ever make are creating and deleting tokens.
+func TestHumanAccessTokenNeverTouchesTheAccount(t *testing.T) {
+	object := humanToken(forgev1.AccessTokenAccountHuman, "jake")
+	object.Spec.RotationNonce = "2"
+	object.Status.RemoteID = "41"
+	r, api, requests := humanHarness(t, humanProvider("jake"), humanAdminSecret(), &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "workstation-token", Namespace: "forgejo", Annotations: map[string]string{credentials.RotationNonceAnnotation: "1"}},
+		Data:       map[string][]byte{"token": []byte("old")},
+	})
+	if _, err := r.reconcile(context.Background(), api, object); err != nil {
+		t.Fatal(err)
+	}
+	object.Status.RemoteID = "42"
+	if err := r.deleteRemote(context.Background(), api, object, "42"); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, request := range *requests {
+		got = append(got, request.method+" "+request.path)
+		if !request.adminAuth || strings.Contains(request.body, "password") {
+			t.Fatalf("%s %s adminAuth=%t", request.method, request.path, request.adminAuth)
+		}
+	}
+	want := "DELETE /api/v1/users/jake/tokens/41,POST /api/v1/users/jake/tokens,DELETE /api/v1/users/jake/tokens/42"
+	if strings.Join(got, ",") != want {
+		t.Fatalf("requests: %s", strings.Join(got, ","))
+	}
+}
+
+// Every refusal must happen before the administrator credential is read (no
+// Secret exists here) and before any request reaches Forgejo.
+func TestHumanAccessTokenRefusals(t *testing.T) {
+	robot := &forgev1.ForgejoRobotAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "forgejo"},
+		Spec:       forgev1.RobotAccountSpec{CommonSpec: forgev1.CommonSpec{ProviderRef: "default"}, Username: "ci"},
+	}
+	otherNamespace := humanToken(forgev1.AccessTokenAccountHuman, "jake")
+	otherNamespace.Spec.ProviderNamespace = "elsewhere"
+	noScopes := humanToken(forgev1.AccessTokenAccountHuman, "jake")
+	noScopes.Spec.Scopes = nil
+	for name, tc := range map[string]struct {
+		provider *forgev1.ForgejoProvider
+		extra    []client.Object
+		object   *forgev1.ForgejoAccessToken
+		want     string
+	}{
+		"robot type on a human, allowlisted": {humanProvider("jake"), nil, humanToken(forgev1.AccessTokenAccountRobot, "jake"), "must reference a managed robot account"},
+		"unset type on a human, allowlisted": {humanProvider("jake"), nil, humanToken("", "jake"), "must reference a managed robot account"},
+		"provider has no policy":             {humanProvider(), nil, humanToken(forgev1.AccessTokenAccountHuman, "jake"), "does not enable humanAccessTokens"},
+		"username not allowlisted":           {humanProvider("jake"), nil, humanToken(forgev1.AccessTokenAccountHuman, "margo"), "allowedUsernames"},
+		"allowlist match is exact":           {humanProvider("jake"), nil, humanToken(forgev1.AccessTokenAccountHuman, "Jake"), "allowedUsernames"},
+		"username is a managed robot":        {humanProvider("ci"), []client.Object{robot}, humanToken(forgev1.AccessTokenAccountHuman, "ci"), "managed robot account"},
+		"provider in another namespace":      {humanProvider("jake"), nil, otherNamespace, "same namespace"},
+		"no scopes":                          {humanProvider("jake"), nil, noScopes, "at least one scope"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, api, requests := humanHarness(t, append(tc.extra, tc.provider)...)
+			_, err := r.reconcile(context.Background(), api, tc.object)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err=%v", err)
+			}
+			if len(*requests) != 0 {
+				t.Fatalf("made %d requests", len(*requests))
+			}
+		})
+	}
+}
+
+func TestHumanAccessTokenIsNoOpWhenStored(t *testing.T) {
+	object := humanToken(forgev1.AccessTokenAccountHuman, "jake")
+	object.Status.RemoteID = "42"
+	r, api, requests := humanHarness(t, humanProvider("jake"), humanAdminSecret(), &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "workstation-token", Namespace: "forgejo", Annotations: map[string]string{credentials.RotationNonceAnnotation: ""}},
+		Data:       map[string][]byte{"token": []byte("stored")},
+	})
+	id, err := r.reconcile(context.Background(), api, object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "42" || len(*requests) != 0 {
+		t.Fatalf("id=%q requests=%v", id, *requests)
+	}
+}
+
+func TestHumanAccessTokenRemovedFromAllowlistDegrades(t *testing.T) {
+	object := humanToken(forgev1.AccessTokenAccountHuman, "jake")
+	stored := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "workstation-token", Namespace: "forgejo", Annotations: map[string]string{credentials.RotationNonceAnnotation: ""}},
+		Data:       map[string][]byte{"token": []byte("stored")},
+	}
+	r, api, requests := humanHarness(t, humanProvider("margo"), humanAdminSecret(), stored)
+	if _, err := r.reconcile(context.Background(), api, object); err == nil || !strings.Contains(err.Error(), "allowedUsernames") {
+		t.Fatalf("err=%v", err)
+	}
+	if len(*requests) != 0 {
+		t.Fatalf("requests=%v", *requests)
+	}
+}
+
+func TestHumanAccessTokenRefusesUnrelatedSecret(t *testing.T) {
+	r, api, requests := humanHarness(t, humanProvider("jake"), humanAdminSecret(), &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "workstation-token", Namespace: "forgejo"},
+		Data:       map[string][]byte{"password": []byte("unrelated")},
+	})
+	_, err := r.reconcile(context.Background(), api, humanToken(forgev1.AccessTokenAccountHuman, "jake"))
+	if err == nil || !strings.Contains(err.Error(), "did not create") {
+		t.Fatalf("err=%v", err)
+	}
+	if len(*requests) != 0 {
+		t.Fatalf("requests=%v", *requests)
+	}
+	var secret corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "forgejo", Name: "workstation-token"}, &secret); err != nil {
+		t.Fatal(err)
+	}
+	if string(secret.Data["password"]) != "unrelated" {
+		t.Fatal("unrelated Secret was overwritten")
+	}
+}
+
+// Without a recorded id the operator must not guess: a same-named token on the
+// account may be one the person made, so it surfaces Forgejo's refusal instead.
+func TestHumanAccessTokenNameCollisionDoesNotRevoke(t *testing.T) {
+	r, _, _ := humanHarness(t, humanProvider("jake"), humanAdminSecret())
+	var requests []string
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests = append(requests, req.Method)
+		return response(http.StatusBadRequest, `{"message":"bad `+humanAdminPassword+`"}`), nil
+	})
+	api, _ := forgeapi.New("https://forgejo.invalid", "admin-api-token", forgeapi.WithHTTPClient(&http.Client{Transport: transport}), forgeapi.WithRetries(0))
+	_, err := r.reconcile(context.Background(), api, humanToken(forgev1.AccessTokenAccountHuman, "jake"))
+	if err == nil || !strings.Contains(err.Error(), "already used") {
+		t.Fatalf("err=%v", err)
+	}
+	if strings.Contains(err.Error(), humanAdminPassword) {
+		t.Fatal("administrator password leaked into the error")
+	}
+	if strings.Join(requests, ",") != http.MethodPost {
+		t.Fatalf("requests=%v", requests)
+	}
+}
+
+func TestHumanAccessTokenMissingAdminSecretErrorsBeforeRequest(t *testing.T) {
+	r, api, requests := humanHarness(t, humanProvider("jake"))
+	_, err := r.reconcile(context.Background(), api, humanToken(forgev1.AccessTokenAccountHuman, "jake"))
+	if err == nil || !strings.Contains(err.Error(), "administrator credential") {
+		t.Fatalf("err=%v", err)
+	}
+	if len(*requests) != 0 {
+		t.Fatalf("requests=%v", *requests)
+	}
+}
+
+// failingSecretWrites makes storing the minted token fail.
+type failingSecretWrites struct{ client.Client }
+
+func (f failingSecretWrites) Create(ctx context.Context, object client.Object, opts ...client.CreateOption) error {
+	if _, ok := object.(*corev1.Secret); ok {
+		return errors.New("secret write refused")
+	}
+	return f.Client.Create(ctx, object, opts...)
+}
+
+func TestHumanAccessTokenRevokedWhenItCannotBeStored(t *testing.T) {
+	r, api, requests := humanHarness(t, humanProvider("jake"), humanAdminSecret())
+	r.Client = failingSecretWrites{r.Client}
+	id, err := r.reconcile(context.Background(), api, humanToken(forgev1.AccessTokenAccountHuman, "jake"))
+	if err == nil || id != "" {
+		t.Fatalf("id=%q err=%v", id, err)
+	}
+	if len(*requests) != 2 || (*requests)[1].method != http.MethodDelete || (*requests)[1].path != "/api/v1/users/jake/tokens/42" || !(*requests)[1].adminAuth {
+		t.Fatalf("requests=%v", *requests)
+	}
+	if strings.Contains(err.Error(), humanMintedToken) {
+		t.Fatal("token value leaked into the error")
+	}
+}
+
+func TestHumanAccessTokenDeleteOnlyAddressesRecordedID(t *testing.T) {
+	object := humanToken(forgev1.AccessTokenAccountHuman, "jake")
+	r, api, requests := humanHarness(t, humanProvider("jake"), humanAdminSecret())
+	if err := r.deleteRemote(context.Background(), api, object, "jake/jake-workstation"); err != nil {
+		t.Fatal(err)
+	}
+	if len(*requests) != 0 {
+		t.Fatalf("requests=%v", *requests)
 	}
 }

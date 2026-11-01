@@ -43,6 +43,40 @@ spec:
                   API reconciliation still uses URL so in-cluster traffic stays private.
                 pattern: ^https?://
                 type: string
+              humanAccessTokens:
+                description: |-
+                  HumanAccessTokens lets ForgejoAccessTokens with accountType Human, in this
+                  provider's namespace, mint tokens for the listed users. Unset refuses them.
+                properties:
+                  adminCredentialsSecretRef:
+                    description: |-
+                      AdminCredentialsSecretRef names a Secret in the provider's namespace with
+                      "username" and "password" keys for a site administrator without WebAuthn or
+                      TOTP enrolled, which Forgejo refuses or challenges on basic authentication.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  allowedUsernames:
+                    description: |-
+                      AllowedUsernames are the exact (case-sensitive) Forgejo usernames that may
+                      receive tokens.
+                    items:
+                      type: string
+                    minItems: 1
+                    type: array
+                required:
+                - adminCredentialsSecretRef
+                - allowedUsernames
+                type: object
               requestTimeout:
                 type: string
               tokenSecretRef:

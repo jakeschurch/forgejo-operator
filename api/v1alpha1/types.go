@@ -44,6 +44,26 @@ type ForgejoProviderSpec struct {
 	ExternalURL    string                   `json:"externalURL,omitempty"`
 	TokenSecretRef corev1.SecretKeySelector `json:"tokenSecretRef"`
 	RequestTimeout metav1.Duration          `json:"requestTimeout,omitempty"`
+	// HumanAccessTokens lets ForgejoAccessTokens with accountType Human, in this
+	// provider's namespace, mint tokens for the listed users. Unset refuses them.
+	// +optional
+	HumanAccessTokens *HumanAccessTokenPolicy `json:"humanAccessTokens,omitempty"`
+}
+
+// HumanAccessTokenPolicy is the provider-side half of human token minting.
+// Forgejo only accepts password authentication on POST /users/{username}/tokens,
+// and an admin API token (with or without Sudo) is rejected, so minting needs a
+// site administrator's password. The operator only reads this credential. It
+// never reads, sets, or resets the password of the human it mints for.
+type HumanAccessTokenPolicy struct {
+	// AllowedUsernames are the exact (case-sensitive) Forgejo usernames that may
+	// receive tokens.
+	// +kubebuilder:validation:MinItems=1
+	AllowedUsernames []string `json:"allowedUsernames"`
+	// AdminCredentialsSecretRef names a Secret in the provider's namespace with
+	// "username" and "password" keys for a site administrator without WebAuthn or
+	// TOTP enrolled, which Forgejo refuses or challenges on basic authentication.
+	AdminCredentialsSecretRef corev1.LocalObjectReference `json:"adminCredentialsSecretRef"`
 }
 
 // +kubebuilder:object:root=true
@@ -116,14 +136,29 @@ type RobotAccountSpec struct {
 	RotationNonce      string `json:"rotationNonce,omitempty"`
 }
 
+// AccessTokenAccountType says which kind of account a ForgejoAccessToken mints for.
+type AccessTokenAccountType string
+
+const (
+	AccessTokenAccountRobot AccessTokenAccountType = "Robot"
+	AccessTokenAccountHuman AccessTokenAccountType = "Human"
+)
+
 // +kubebuilder:validation:XValidation:rule="self.providerRef == oldSelf.providerRef && self.username == oldSelf.username && self.name == oldSelf.name",message="providerRef, username, and name are immutable"
+// +kubebuilder:validation:XValidation:rule="(has(self.accountType) ? self.accountType : 'Robot') == (has(oldSelf.accountType) ? oldSelf.accountType : 'Robot')",message="accountType is immutable"
 type AccessTokenSpec struct {
-	CommonSpec    `json:",inline"`
-	Username      string   `json:"username"`
-	Name          string   `json:"name"`
-	Scopes        []string `json:"scopes,omitempty"`
-	SecretName    string   `json:"secretName,omitempty"`
-	RotationNonce string   `json:"rotationNonce,omitempty"`
+	CommonSpec `json:",inline"`
+	// AccountType Robot mints with the password of a ForgejoRobotAccount in this
+	// namespace. Human is an explicit opt-in to mint for an existing person, and
+	// also requires the username in the provider's humanAccessTokens allowlist.
+	// +kubebuilder:default=Robot
+	// +kubebuilder:validation:Enum=Robot;Human
+	AccountType   AccessTokenAccountType `json:"accountType,omitempty"`
+	Username      string                 `json:"username"`
+	Name          string                 `json:"name"`
+	Scopes        []string               `json:"scopes,omitempty"`
+	SecretName    string                 `json:"secretName,omitempty"`
+	RotationNonce string                 `json:"rotationNonce,omitempty"`
 }
 
 // +kubebuilder:validation:XValidation:rule="self.providerRef == oldSelf.providerRef && self.owner == oldSelf.owner && self.name == oldSelf.name",message="providerRef, owner, and name are immutable"

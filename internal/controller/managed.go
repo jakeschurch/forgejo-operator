@@ -278,6 +278,9 @@ func (r *managedReconciler) reconcile(ctx context.Context, api *forgeapi.Client,
 		}
 		return strconv.FormatInt(remote.ID, 10), err
 	case *forgev1.ForgejoAccessToken:
+		if v.Spec.AccountType == forgev1.AccessTokenAccountHuman {
+			return r.reconcileHumanAccessToken(ctx, api, v)
+		}
 		name := v.Spec.SecretName
 		if name == "" {
 			name = v.Name + "-token"
@@ -491,6 +494,9 @@ func (r *managedReconciler) deleteRemote(ctx context.Context, api *forgeapi.Clie
 	// a collection endpoint on a guess.
 	if id == "" {
 		return nil
+	}
+	if token, ok := object.(*forgev1.ForgejoAccessToken); ok && token.Spec.AccountType == forgev1.AccessTokenAccountHuman {
+		return r.deleteHumanAccessToken(ctx, api, token, id)
 	}
 	var path string
 	switch v := object.(type) {

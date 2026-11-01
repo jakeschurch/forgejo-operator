@@ -13,6 +13,7 @@ import (
 	"github.com/jakeschurch/forgejo-operator/internal/credentials"
 	forgeapi "github.com/jakeschurch/forgejo-operator/internal/forgejo"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -1162,5 +1163,272 @@ func TestHumanAccessTokenDeleteOnlyAddressesRecordedID(t *testing.T) {
 	}
 	if len(*requests) != 0 {
 		t.Fatalf("requests=%v", *requests)
+	}
+}
+
+const (
+	robotTestPassword = "sensitive-robot-password"
+	robotMintedToken  = "generated-robot-token"
+)
+
+func robotObjects(extra ...client.Object) []client.Object {
+	return append([]client.Object{
+		&forgev1.ForgejoRobotAccount{
+			ObjectMeta: metav1.ObjectMeta{Name: "ci", Namespace: "argo"},
+			Spec:       forgev1.RobotAccountSpec{CommonSpec: forgev1.CommonSpec{ProviderRef: "default"}, Username: "ci", PasswordSecretName: "ci-password"},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "ci-password", Namespace: "argo"},
+			Data:       map[string][]byte{"password": []byte(robotTestPassword)},
+		},
+	}, extra...)
+}
+
+func robotToken(remoteID string) *forgev1.ForgejoAccessToken {
+	object := &forgev1.ForgejoAccessToken{
+		TypeMeta:   metav1.TypeMeta{Kind: "ForgejoAccessToken"},
+		ObjectMeta: metav1.ObjectMeta{Name: "reader", Namespace: "argo"},
+		Spec: forgev1.AccessTokenSpec{
+			CommonSpec: forgev1.CommonSpec{ProviderRef: "default"},
+			Username:   "ci", Name: "5", SecretName: "reader-token",
+		},
+	}
+	object.Status.RemoteID = remoteID
+	return object
+}
+
+func robotSecret(nonce string) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "reader-token", Namespace: "argo", Annotations: map[string]string{credentials.RotationNonceAnnotation: nonce}},
+		Data:       map[string][]byte{"token": []byte("old")},
+	}
+}
+
+// robotHarness serves a token listing in which id 5 is another token and the CR's
+// token, named "5", has id 7. Requests are recorded as "METHOD path" and every one
+// is checked to authenticate as the robot, except looking up the account.
+func robotHarness(t *testing.T, status func(*http.Request) int, objects ...client.Object) (*managedReconciler, *forgeapi.Client, *[]string) {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = forgev1.AddToScheme(scheme)
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+	var requests []string
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		if r.URL.Path != "/api/v1/users/ci" {
+			if user, password, _ := r.BasicAuth(); user != "ci" || password != robotTestPassword {
+				t.Errorf("%s %s did not authenticate as the robot", r.Method, r.URL.Path)
+			}
+		}
+		if status != nil {
+			if code := status(r); code != 0 {
+				return response(code, `{"message":"`+robotTestPassword+`"}`), nil
+			}
+		}
+		switch r.Method {
+		case http.MethodDelete:
+			return response(http.StatusNoContent, ""), nil
+		case http.MethodPost:
+			return response(http.StatusCreated, `{"id":8,"sha1":"`+robotMintedToken+`"}`), nil
+		}
+		if r.URL.Query().Get("page") == "1" {
+			return response(http.StatusOK, `[{"id":5,"name":"other"},{"id":7,"name":"5"}]`), nil
+		}
+		return response(http.StatusOK, `[]`), nil
+	})
+	api, err := forgeapi.New("https://forgejo.invalid", "admin-api-token", forgeapi.WithHTTPClient(&http.Client{Transport: transport}), forgeapi.WithRetries(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &managedReconciler{Reconciler: Reconciler{Client: kube}}, api, &requests
+}
+
+func requireRequests(t *testing.T, got *[]string, want ...string) {
+	t.Helper()
+	if strings.Join(*got, ",") != strings.Join(want, ",") {
+		t.Fatalf("requests:\n got %s\nwant %s", strings.Join(*got, ","), strings.Join(want, ","))
+	}
+}
+
+const (
+	robotList   = "GET /api/v1/users/ci/tokens"
+	robotMint   = "POST /api/v1/users/ci/tokens"
+	robotRevoke = "DELETE /api/v1/users/ci/tokens/7"
+)
+
+// Forgejo answers 400 to a name already in use, and every deployed CR records
+// username/name, so the old token has to be found by its name and revoked first.
+func TestRobotAccessTokenRotationRevokesThenMints(t *testing.T) {
+	object := robotToken("ci/5")
+	object.Spec.RotationNonce = "2"
+	r, api, requests := robotHarness(t, nil, robotObjects(robotSecret("1"))...)
+	id, err := r.reconcile(context.Background(), api, object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "8" {
+		t.Fatalf("id=%q", id)
+	}
+	requireRequests(t, requests, robotList, robotRevoke, robotMint)
+	var secret corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "argo", Name: "reader-token"}, &secret); err != nil {
+		t.Fatal(err)
+	}
+	if string(secret.Data["token"]) != robotMintedToken || secret.Annotations[credentials.RotationNonceAnnotation] != "2" {
+		t.Fatalf("secret not rotated: %v", secret.Annotations)
+	}
+}
+
+func TestRobotAccessTokenRotationRetriesAfterTokenAlreadyGone(t *testing.T) {
+	object := robotToken("ci/5")
+	object.Spec.Name = "absent"
+	object.Spec.RotationNonce = "2"
+	r, api, requests := robotHarness(t, nil, robotObjects(robotSecret("1"))...)
+	if _, err := r.reconcile(context.Background(), api, object); err != nil {
+		t.Fatal(err)
+	}
+	requireRequests(t, requests, robotList, robotList, robotMint)
+}
+
+func TestRobotAccessTokenRotationKeepsSecretWhenRevokeFails(t *testing.T) {
+	object := robotToken("ci/5")
+	object.Spec.RotationNonce = "2"
+	r, api, requests := robotHarness(t, func(req *http.Request) int {
+		if req.Method == http.MethodDelete {
+			return http.StatusUnauthorized
+		}
+		return 0
+	}, robotObjects(robotSecret("1"))...)
+	_, err := r.reconcile(context.Background(), api, object)
+	if err == nil || strings.Contains(err.Error(), robotTestPassword) {
+		t.Fatalf("err=%v", err)
+	}
+	requireRequests(t, requests, robotList, robotRevoke)
+	var secret corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "argo", Name: "reader-token"}, &secret); err != nil {
+		t.Fatal(err)
+	}
+	if string(secret.Data["token"]) != "old" || secret.Annotations[credentials.RotationNonceAnnotation] != "1" {
+		t.Fatal("secret changed although the rotation failed")
+	}
+}
+
+// Without an operator annotation nothing says this CR ever minted the token.
+func TestRobotAccessTokenFirstMintRevokesNothing(t *testing.T) {
+	for name, objects := range map[string][]client.Object{
+		"no secret":          robotObjects(),
+		"unannotated secret": robotObjects(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "reader-token", Namespace: "argo"}}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			object := robotToken("")
+			object.Spec.RotationNonce = "2"
+			r, api, requests := robotHarness(t, nil, objects...)
+			if _, err := r.reconcile(context.Background(), api, object); err != nil {
+				t.Fatal(err)
+			}
+			requireRequests(t, requests, robotMint)
+		})
+	}
+}
+
+func TestRobotAccessTokenRevokedWhenItCannotBeStored(t *testing.T) {
+	r, api, requests := robotHarness(t, nil, robotObjects()...)
+	r.Client = failingSecretWrites{r.Client}
+	id, err := r.reconcile(context.Background(), api, robotToken(""))
+	if err == nil || id != "" || strings.Contains(err.Error(), robotMintedToken) {
+		t.Fatalf("id=%q err=%v", id, err)
+	}
+	requireRequests(t, requests, robotMint, "DELETE /api/v1/users/ci/tokens/8")
+}
+
+func TestRobotAccessTokenDeleteUsesRobotPasswordAndResolvedID(t *testing.T) {
+	for _, recorded := range []string{"ci/5", "7"} {
+		t.Run(recorded, func(t *testing.T) {
+			r, api, requests := robotHarness(t, nil, robotObjects()...)
+			if err := r.deleteRemote(context.Background(), api, robotToken(recorded), recorded); err != nil {
+				t.Fatal(err)
+			}
+			requireRequests(t, requests, robotList, robotRevoke)
+		})
+	}
+}
+
+func TestRobotAccessTokenDeleteWithoutRecordedIDDoesNothing(t *testing.T) {
+	r, api, requests := robotHarness(t, nil, robotObjects()...)
+	if err := r.deleteRemote(context.Background(), api, robotToken(""), ""); err != nil {
+		t.Fatal(err)
+	}
+	requireRequests(t, requests)
+}
+
+func TestRobotAccessTokenDeleteOfMissingAccountSucceeds(t *testing.T) {
+	notFound := func(*http.Request) int { return http.StatusNotFound }
+	r, api, requests := robotHarness(t, notFound)
+	if err := r.deleteRemote(context.Background(), api, robotToken("ci/5"), "ci/5"); err != nil {
+		t.Fatal(err)
+	}
+	requireRequests(t, requests, "GET /api/v1/users/ci")
+}
+
+func TestRobotAccessTokenDeleteKeepsFinalizerWithoutCredential(t *testing.T) {
+	r, api, requests := robotHarness(t, func(*http.Request) int { return http.StatusOK })
+	err := r.deleteRemote(context.Background(), api, robotToken("ci/5"), "ci/5")
+	if err == nil || !strings.Contains(err.Error(), "deletionPolicy Orphan") {
+		t.Fatalf("err=%v", err)
+	}
+	requireRequests(t, requests, "GET /api/v1/users/ci")
+}
+
+func TestAccessTokenFailedDeleteIsReportedAndRetried(t *testing.T) {
+	now := metav1.Now()
+	object := robotToken("ci/5")
+	object.Namespace = "argo"
+	object.Finalizers = []string{finalizer}
+	object.DeletionTimestamp = &now
+	object.Spec.DeletionPolicy = forgev1.DeletionPolicyDelete
+	object.Status.GeneratedSecrets = []corev1.LocalObjectReference{{Name: "reader-token"}}
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = forgev1.AddToScheme(scheme)
+	kube := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&forgev1.ForgejoAccessToken{}).
+		WithObjects(append(robotObjects(robotSecret("")), object,
+			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "admin-token", Namespace: "argo"}, Data: map[string][]byte{"token": []byte("admin")}},
+			&forgev1.ForgejoProvider{
+				ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "argo"},
+				Spec: forgev1.ForgejoProviderSpec{
+					URL:            "https://forgejo.invalid",
+					TokenSecretRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "admin-token"}, Key: "token"},
+				},
+			})...).Build()
+	transport := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return response(http.StatusUnauthorized, `{"message":"denied"}`), nil
+	})
+	r := &managedReconciler{
+		Reconciler: Reconciler{Client: kube, Transport: transport},
+		newObject:  func() client.Object { return &forgev1.ForgejoAccessToken{} },
+	}
+	key := client.ObjectKey{Namespace: "argo", Name: "reader"}
+	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter == 0 {
+		t.Fatal("a failed delete must be retried")
+	}
+	var stored forgev1.ForgejoAccessToken
+	if err := kube.Get(context.Background(), key, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if !contains(stored.Finalizers, finalizer) {
+		t.Fatal("finalizer removed although the token was not revoked")
+	}
+	if degraded := meta.FindStatusCondition(stored.Status.Conditions, "Degraded"); degraded == nil || degraded.Status != metav1.ConditionTrue {
+		t.Fatalf("degraded=%+v", degraded)
+	}
+	var secret corev1.Secret
+	if err := kube.Get(context.Background(), client.ObjectKey{Namespace: "argo", Name: "reader-token"}, &secret); err != nil {
+		t.Fatalf("Secret was deleted although the token was not revoked: %v", err)
 	}
 }

@@ -36,6 +36,10 @@ Forgejo requires password authentication on `POST /users/{username}/tokens` and
 `DELETE /users/{username}/tokens/{id}`. An admin API token is rejected even with
 `Sudo`, so the provider token cannot be used. The operator reads the administrator
 password and never changes any account: it only creates and deletes tokens.
+Forgejo also refuses that administrator's password while the account has TOTP
+enrolled (401, on every request), and the operator cannot supply a one-time code,
+so `adminCredentialsSecretRef` must name an administrator without TOTP. TOTP on the
+person being minted for does not matter.
 
 A rotation (`rotationNonce` change) or `deletionPolicy: Delete` removes only the
 token id this CR recorded in `status.remoteID`, never a token matched by name. If
@@ -43,3 +47,17 @@ the name is already used on the account, creation fails and the CR reports it un
 that token is removed in Forgejo. Removing a username from the allowlist degrades
 the CR but neither revokes the token nor deletes its Secret. An existing Secret
 without the operator's rotation annotation is refused rather than overwritten.
+
+## Access tokens for robots
+
+The same endpoints authenticate as the robot, with the password Secret of the
+`ForgejoRobotAccount` whose `username` matches; the provider token is refused here
+too. A rotation or `deletionPolicy: Delete` revokes the robot's token named
+`spec.name`, since the operator owns that account. The name is resolved to an id by
+listing the account's tokens, because Forgejo reads a numeric path segment as an id.
+
+`deletionPolicy: Delete` needs that password to be available. If the account no
+longer exists its tokens are gone and deletion succeeds. Otherwise, without a usable
+password (the robot CR or its Secret was removed, and the account was orphaned), the
+CR stays `Degraded` and retries; set `deletionPolicy: Orphan` to keep the token and
+let it go.

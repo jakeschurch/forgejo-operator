@@ -90,7 +90,11 @@ func (r *managedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				return ctrl.Result{}, r.Update(ctx, object)
 			}
 		}
-		return ctrl.Result{}, nil
+		if err == nil {
+			return ctrl.Result{}, nil
+		}
+		// A failed remote delete keeps the finalizer: report it and retry, or the
+		// object sits in Terminating with nothing saying why.
 	}
 	setStatus(status, object.GetGeneration(), err)
 	if updateErr := r.Status().Update(ctx, object); updateErr != nil && !apierrors.IsNotFound(updateErr) {
@@ -294,34 +298,20 @@ func (r *managedReconciler) reconcile(ctx context.Context, api *forgeapi.Client,
 		if err != nil && !apierrors.IsNotFound(err) {
 			return "", err
 		}
+		password, err := r.robotPassword(ctx, v)
+		if err != nil {
+			return "", err
+		}
+		// Forgejo refuses a token name already in use on the account, so the
+		// token being rotated has to go first.
+		if nonce, managed := existing.Annotations[credentials.RotationNonceAnnotation]; exists && managed && nonce != v.Spec.RotationNonce {
+			if err := revokeRobotToken(ctx, api, v, password); err != nil {
+				return "", fmt.Errorf("revoke rotated token: %w", err)
+			}
+		}
 		var created struct {
 			ID   int64  `json:"id"`
 			SHA1 string `json:"sha1"`
-		}
-		var robots forgev1.ForgejoRobotAccountList
-		if err := r.List(ctx, &robots, client.InNamespace(v.Namespace)); err != nil {
-			return "", fmt.Errorf("list robot accounts: %w", err)
-		}
-		passwordSecretName := ""
-		for i := range robots.Items {
-			robot := &robots.Items[i]
-			if robot.Spec.ProviderRef == v.Spec.ProviderRef && robot.Spec.Username == v.Spec.Username {
-				passwordSecretName = robot.Spec.PasswordSecretName
-				if passwordSecretName == "" {
-					passwordSecretName = robot.Name + "-password"
-				}
-				break
-			}
-		}
-		if passwordSecretName == "" {
-			return "", errors.New("access token username must reference a managed robot account")
-		}
-		password, err := r.secretValue(ctx, v.Namespace, corev1.SecretKeySelector{
-			LocalObjectReference: corev1.LocalObjectReference{Name: passwordSecretName},
-			Key:                  "password",
-		}, "password")
-		if err != nil {
-			return "", fmt.Errorf("read robot credential: %w", err)
 		}
 		path := "users/" + esc(v.Spec.Username) + "/tokens"
 		if err := api.DoBasic(ctx, http.MethodPost, path, v.Spec.Username, password, map[string]any{"name": v.Spec.Name, "scopes": v.Spec.Scopes}, &created); err != nil {
@@ -334,7 +324,15 @@ func (r *managedReconciler) reconcile(ctx context.Context, api *forgeapi.Client,
 		} else {
 			err = r.Create(ctx, secret)
 		}
-		return strconv.FormatInt(created.ID, 10), err
+		id := strconv.FormatInt(created.ID, 10)
+		if err != nil {
+			// The value is unrecoverable, and an unstored token blocks its own name.
+			if revokeErr := revokeAccessToken(ctx, api, v, v.Spec.Username, password, id); revokeErr != nil {
+				return "", fmt.Errorf("store token: %w; revoke unstored token %s: %w", err, id, revokeErr)
+			}
+			return "", fmt.Errorf("store token: %w", err)
+		}
+		return id, nil
 	case *forgev1.ForgejoCollaborator:
 		path := repoPath(v.Spec.Owner, v.Spec.Repository) + "/collaborators/" + esc(v.Spec.Username)
 		return v.Spec.Username, api.Do(ctx, http.MethodPut, path, map[string]any{"permission": v.Spec.Permission}, nil)
@@ -495,8 +493,11 @@ func (r *managedReconciler) deleteRemote(ctx context.Context, api *forgeapi.Clie
 	if id == "" {
 		return nil
 	}
-	if token, ok := object.(*forgev1.ForgejoAccessToken); ok && token.Spec.AccountType == forgev1.AccessTokenAccountHuman {
-		return r.deleteHumanAccessToken(ctx, api, token, id)
+	if token, ok := object.(*forgev1.ForgejoAccessToken); ok {
+		if token.Spec.AccountType == forgev1.AccessTokenAccountHuman {
+			return r.deleteHumanAccessToken(ctx, api, token, id)
+		}
+		return r.deleteRobotAccessToken(ctx, api, token)
 	}
 	var path string
 	switch v := object.(type) {
@@ -506,8 +507,6 @@ func (r *managedReconciler) deleteRemote(ctx context.Context, api *forgeapi.Clie
 		path = "orgs/" + esc(v.Spec.Organization) + "/members/" + esc(v.Spec.Username)
 	case *forgev1.ForgejoRobotAccount:
 		path = "admin/users/" + esc(v.Spec.Username)
-	case *forgev1.ForgejoAccessToken:
-		path = "users/" + esc(v.Spec.Username) + "/tokens/" + esc(v.Spec.Name)
 	case *forgev1.ForgejoCollaborator:
 		path = repoPath(v.Spec.Owner, v.Spec.Repository) + "/collaborators/" + esc(v.Spec.Username)
 	case *forgev1.ForgejoDeployKey:

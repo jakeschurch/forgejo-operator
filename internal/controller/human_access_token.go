@@ -85,9 +85,9 @@ func recordedTokenID(remoteID string) (string, bool) {
 	return strconv.FormatInt(id, 10), true
 }
 
-func revokeHumanToken(ctx context.Context, api *forgeapi.Client, v *forgev1.ForgejoAccessToken, adminUser, adminPassword, id string) error {
+func revokeAccessToken(ctx context.Context, api *forgeapi.Client, v *forgev1.ForgejoAccessToken, authUser, authPassword, id string) error {
 	path := "users/" + esc(v.Spec.Username) + "/tokens/" + id
-	err := api.DoBasic(ctx, http.MethodDelete, path, adminUser, adminPassword, nil, nil)
+	err := api.DoBasic(ctx, http.MethodDelete, path, authUser, authPassword, nil, nil)
 	if isNotFound(err) {
 		return nil
 	}
@@ -129,7 +129,7 @@ func (r *managedReconciler) reconcileHumanAccessToken(ctx context.Context, api *
 		return "", err
 	}
 	if id, ok := recordedTokenID(v.Status.RemoteID); ok && rotating {
-		if err := revokeHumanToken(ctx, api, v, adminUser, adminPassword, id); err != nil {
+		if err := revokeAccessToken(ctx, api, v, adminUser, adminPassword, id); err != nil {
 			return "", fmt.Errorf("revoke rotated token: %w", err)
 		}
 	}
@@ -159,7 +159,7 @@ func (r *managedReconciler) reconcileHumanAccessToken(ctx context.Context, api *
 	if err != nil {
 		// The value is unrecoverable, so an unstored token is an unusable live
 		// credential on a person's account that also blocks its own name.
-		if revokeErr := revokeHumanToken(ctx, api, v, adminUser, adminPassword, id); revokeErr != nil {
+		if revokeErr := revokeAccessToken(ctx, api, v, adminUser, adminPassword, id); revokeErr != nil {
 			return "", fmt.Errorf("store token: %w; revoke unstored token %s: %w", err, id, revokeErr)
 		}
 		return "", fmt.Errorf("store token: %w", err)
@@ -182,5 +182,5 @@ func (r *managedReconciler) deleteHumanAccessToken(ctx context.Context, api *for
 	if err != nil {
 		return err
 	}
-	return revokeHumanToken(ctx, api, v, adminUser, adminPassword, id)
+	return revokeAccessToken(ctx, api, v, adminUser, adminPassword, id)
 }

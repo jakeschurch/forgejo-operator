@@ -37,6 +37,16 @@ spec:
             type: object
           spec:
             properties:
+              allowManualMerge:
+                description: |-
+                  AllowManualMerge permits recording a merge already performed through Git.
+                  Omission leaves the remote setting unchanged; false explicitly disables it.
+                type: boolean
+              autodetectManualMerge:
+                description: |-
+                  AutodetectManualMerge lets Forgejo mark PRs merged after a Git push.
+                  Omission leaves the remote setting unchanged; false explicitly disables it.
+                type: boolean
               defaultBranch:
                 type: string
               deletionPolicy:

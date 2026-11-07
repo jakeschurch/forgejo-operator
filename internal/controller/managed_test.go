@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -216,6 +217,73 @@ func TestRepositoryPatchPreservesOmittedFields(t *testing.T) {
 	payload := repositoryPatch(forgev1.RepositorySpec{DefaultBranch: "main", Visibility: "private", Features: map[string]bool{"issues": false}})
 	if payload["default_branch"] != "main" || payload["private"] != true || payload["has_issues"] != false {
 		t.Fatalf("declared fields missing from patch: %#v", payload)
+	}
+}
+
+func TestRepositoryPatchMergeSettings(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		payload := repositoryPatch(forgev1.RepositorySpec{
+			AllowManualMerge: &enabled, AutodetectManualMerge: &enabled,
+		})
+		if len(payload) != 2 || payload["allow_manual_merge"] != enabled || payload["autodetect_manual_merge"] != enabled {
+			t.Fatalf("explicit %v not preserved: %#v", enabled, payload)
+		}
+	}
+}
+
+func TestRepositoryReconcilesSettingsOnCreationAndAdoption(t *testing.T) {
+	for _, exists := range []bool{false, true} {
+		t.Run(fmt.Sprint("exists=", exists), func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			_ = corev1.AddToScheme(scheme)
+			_ = forgev1.AddToScheme(scheme)
+			enabled := true
+			object := &forgev1.ForgejoRepository{
+				ObjectMeta: metav1.ObjectMeta{Name: "queue", Namespace: "forgejo"},
+				Spec:       forgev1.RepositorySpec{CommonSpec: forgev1.CommonSpec{ProviderRef: "default"}, Owner: "owner", Name: "queue", AllowManualMerge: &enabled, AutodetectManualMerge: &enabled},
+			}
+			kube := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(object).WithObjects(object,
+				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "provider-token", Namespace: "forgejo"}, Data: map[string][]byte{"token": []byte("fixture")}},
+				&forgev1.ForgejoProvider{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "forgejo"}, Spec: forgev1.ForgejoProviderSpec{URL: "https://forgejo.invalid", TokenSecretRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "provider-token"}, Key: "token"}}},
+			).Build()
+			created, patched := false, false
+			transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				switch r.Method {
+				case http.MethodGet:
+					if !exists {
+						return response(http.StatusNotFound, `{}`), nil
+					}
+					return response(http.StatusOK, `{"id":7}`), nil
+				case http.MethodPost:
+					created = true
+					return response(http.StatusCreated, `{"id":7}`), nil
+				case http.MethodPatch:
+					var payload map[string]any
+					if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+						t.Fatal(err)
+					}
+					patched = payload["allow_manual_merge"] == true && payload["autodetect_manual_merge"] == true
+					return response(http.StatusOK, `{"id":7}`), nil
+				default:
+					t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+					return nil, nil
+				}
+			})
+			r := RepositoryReconciler{Reconciler: Reconciler{Client: kube, Transport: transport}}
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(object)}); err != nil {
+				t.Fatal(err)
+			}
+			if !patched || created == exists {
+				t.Fatalf("exists=%v created=%v patched=%v", exists, created, patched)
+			}
+			if err := kube.Get(context.Background(), client.ObjectKeyFromObject(object), object); err != nil {
+				t.Fatal(err)
+			}
+			ready := meta.FindStatusCondition(object.Status.Conditions, "Ready")
+			if ready == nil || ready.Status != metav1.ConditionTrue {
+				t.Fatalf("repository not Ready: %+v", object.Status)
+			}
+		})
 	}
 }
 

@@ -16,6 +16,17 @@ Credentials are never copied to specs, status, events, or logs.
 The operator watches all namespaces, but all Secret references are resolved in
 the custom resource's namespace.
 
+## Repository merge detection
+
+`ForgejoRepository.spec.allowManualMerge` permits Forgejo's native API to record
+an already-landed Git merge. `autodetectManualMerge` enables Forgejo's own detection
+when a push includes a pull request's commits. Git-based merge queues should set
+both to `true`; no queue-specific merge detection is implemented by the operator.
+
+These optional booleans preserve remote settings when omitted. Explicit `false`
+disables the corresponding setting. Settings are reconciled on initial creation
+as well as adoption, and normal repository drift reconciliation restores them.
+
 ## Access tokens for human users
 
 `ForgejoAccessToken` mints for a managed robot by default. Minting for an

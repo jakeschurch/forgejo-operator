@@ -352,7 +352,10 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 					err = api.Do(ctx, http.MethodPost, "admin/users/"+object.Spec.Owner+"/repos", payload, &remote)
 				}
 			}
-		} else if err == nil {
+		}
+		// Creation and adoption both need the declared settings. The create API
+		// does not expose every edit option, including manual merge detection.
+		if err == nil {
 			payload := repositoryPatch(object.Spec)
 			if len(payload) > 0 {
 				err = api.Do(ctx, http.MethodPatch, path, payload, nil)
@@ -388,6 +391,12 @@ func repositoryPatch(spec forgev1.RepositorySpec) map[string]any {
 	}
 	for feature, enabled := range spec.Features {
 		payload["has_"+feature] = enabled
+	}
+	if spec.AllowManualMerge != nil {
+		payload["allow_manual_merge"] = *spec.AllowManualMerge
+	}
+	if spec.AutodetectManualMerge != nil {
+		payload["autodetect_manual_merge"] = *spec.AutodetectManualMerge
 	}
 	return payload
 }

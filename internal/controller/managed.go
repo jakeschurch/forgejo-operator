@@ -36,7 +36,7 @@ type managedReconciler struct {
 }
 
 func (r *managedReconciler) SetupWithManager(m ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(m).For(r.newObject()).Complete(r)
+	return ctrl.NewControllerManagedBy(m).For(r.newObject()).WithEventFilter(primaryResourceChanges()).Complete(r)
 }
 
 func (r *managedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

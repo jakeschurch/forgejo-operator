@@ -206,7 +206,7 @@ func (r *ProviderReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	return ctrl.Result{RequeueAfter: 10 * time.Minute}, nil
 }
 func (r *ProviderReconciler) SetupWithManager(m ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(m).For(&forgev1.ForgejoProvider{}).Complete(r)
+	return ctrl.NewControllerManagedBy(m).For(&forgev1.ForgejoProvider{}).WithEventFilter(primaryResourceChanges()).Complete(r)
 }
 
 type OrganizationReconciler struct{ Reconciler }
@@ -277,7 +277,7 @@ func (r *OrganizationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return ctrl.Result{RequeueAfter: 10 * time.Minute}, nil
 }
 func (r *OrganizationReconciler) SetupWithManager(m ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(m).For(&forgev1.ForgejoOrganization{}).Complete(r)
+	return ctrl.NewControllerManagedBy(m).For(&forgev1.ForgejoOrganization{}).WithEventFilter(primaryResourceChanges()).Complete(r)
 }
 
 type RepositoryReconciler struct{ Reconciler }
@@ -401,7 +401,7 @@ func repositoryPatch(spec forgev1.RepositorySpec) map[string]any {
 	return payload
 }
 func (r *RepositoryReconciler) SetupWithManager(m ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(m).For(&forgev1.ForgejoRepository{}).Complete(r)
+	return ctrl.NewControllerManagedBy(m).For(&forgev1.ForgejoRepository{}).WithEventFilter(primaryResourceChanges()).Complete(r)
 }
 
 func setStatus(status *forgev1.CommonStatus, generation int64, reconcileErr error) {

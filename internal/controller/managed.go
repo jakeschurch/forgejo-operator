@@ -36,7 +36,7 @@ type managedReconciler struct {
 }
 
 func (r *managedReconciler) SetupWithManager(m ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(m).For(r.newObject()).Complete(r)
+	return ctrl.NewControllerManagedBy(m).For(r.newObject()).WithEventFilter(primaryResourceChanges()).Complete(r)
 }
 
 func (r *managedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -433,7 +433,7 @@ func (r *managedReconciler) reconcile(ctx context.Context, api *forgeapi.Client,
 		return strconv.FormatInt(created.ID, 10), err
 	case *forgev1.ForgejoBranchProtection:
 		path := repoPath(v.Spec.Owner, v.Spec.Repository) + "/branch_protections/" + esc(v.Spec.Branch)
-		payload := map[string]any{"branch_name": v.Spec.Branch, "required_approvals": v.Spec.RequiredApprovals, "status_check_contexts": v.Spec.RequiredStatusContexts, "enable_push": v.Spec.EnablePush, "enable_merge_whitelist": v.Spec.EnableMerge}
+		payload := map[string]any{"branch_name": v.Spec.Branch, "required_approvals": v.Spec.RequiredApprovals, "status_check_contexts": append([]string{}, v.Spec.RequiredStatusContexts...), "enable_status_check": len(v.Spec.RequiredStatusContexts) > 0, "enable_push": v.Spec.EnablePush, "enable_merge_whitelist": v.Spec.EnableMerge}
 		var remote map[string]any
 		err := api.Do(ctx, http.MethodGet, path, nil, &remote)
 		if isNotFound(err) {

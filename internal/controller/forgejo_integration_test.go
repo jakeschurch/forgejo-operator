@@ -205,7 +205,7 @@ func newOperatorHarness(t *testing.T, f *forgejoInstance, allowed ...string) *op
 	_ = corev1.AddToScheme(scheme)
 	_ = forgev1.AddToScheme(scheme)
 	kube := fake.NewClientBuilder().WithScheme(scheme).
-		WithStatusSubresource(&forgev1.ForgejoAccessToken{}, &forgev1.ForgejoRobotAccount{}).
+		WithStatusSubresource(&forgev1.ForgejoAccessToken{}, &forgev1.ForgejoRobotAccount{}, &forgev1.ForgejoRepository{}).
 		WithObjects(
 			&corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{Name: "provider-token", Namespace: integrationNamespace},

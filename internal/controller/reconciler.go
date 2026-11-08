@@ -206,7 +206,7 @@ func (r *ProviderReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	return ctrl.Result{RequeueAfter: 10 * time.Minute}, nil
 }
 func (r *ProviderReconciler) SetupWithManager(m ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(m).For(&forgev1.ForgejoProvider{}).Complete(r)
+	return ctrl.NewControllerManagedBy(m).For(&forgev1.ForgejoProvider{}).WithEventFilter(primaryResourceChanges()).Complete(r)
 }
 
 type OrganizationReconciler struct{ Reconciler }
@@ -277,7 +277,7 @@ func (r *OrganizationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return ctrl.Result{RequeueAfter: 10 * time.Minute}, nil
 }
 func (r *OrganizationReconciler) SetupWithManager(m ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(m).For(&forgev1.ForgejoOrganization{}).Complete(r)
+	return ctrl.NewControllerManagedBy(m).For(&forgev1.ForgejoOrganization{}).WithEventFilter(primaryResourceChanges()).Complete(r)
 }
 
 type RepositoryReconciler struct{ Reconciler }
@@ -352,7 +352,10 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 					err = api.Do(ctx, http.MethodPost, "admin/users/"+object.Spec.Owner+"/repos", payload, &remote)
 				}
 			}
-		} else if err == nil {
+		}
+		// Creation and adoption both need the declared settings. The create API
+		// does not expose every edit option, including manual merge detection.
+		if err == nil {
 			payload := repositoryPatch(object.Spec)
 			if len(payload) > 0 {
 				err = api.Do(ctx, http.MethodPatch, path, payload, nil)
@@ -389,10 +392,16 @@ func repositoryPatch(spec forgev1.RepositorySpec) map[string]any {
 	for feature, enabled := range spec.Features {
 		payload["has_"+feature] = enabled
 	}
+	if spec.AllowManualMerge != nil {
+		payload["allow_manual_merge"] = *spec.AllowManualMerge
+	}
+	if spec.AutodetectManualMerge != nil {
+		payload["autodetect_manual_merge"] = *spec.AutodetectManualMerge
+	}
 	return payload
 }
 func (r *RepositoryReconciler) SetupWithManager(m ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(m).For(&forgev1.ForgejoRepository{}).Complete(r)
+	return ctrl.NewControllerManagedBy(m).For(&forgev1.ForgejoRepository{}).WithEventFilter(primaryResourceChanges()).Complete(r)
 }
 
 func setStatus(status *forgev1.CommonStatus, generation int64, reconcileErr error) {

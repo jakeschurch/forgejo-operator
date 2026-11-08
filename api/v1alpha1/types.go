@@ -172,6 +172,12 @@ type RepositorySpec struct {
 	Topics        []string          `json:"topics,omitempty"`
 	Features      map[string]bool   `json:"features,omitempty"`
 	Import        *RepositoryImport `json:"import,omitempty"`
+	// AllowManualMerge permits recording a merge already performed through Git.
+	// Omission leaves the remote setting unchanged; false explicitly disables it.
+	AllowManualMerge *bool `json:"allowManualMerge,omitempty"`
+	// AutodetectManualMerge lets Forgejo mark PRs merged after a Git push.
+	// Omission leaves the remote setting unchanged; false explicitly disables it.
+	AutodetectManualMerge *bool `json:"autodetectManualMerge,omitempty"`
 }
 type RepositoryImport struct {
 	CloneURL             string                    `json:"cloneURL"`

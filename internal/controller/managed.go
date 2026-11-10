@@ -453,6 +453,19 @@ func (r *managedReconciler) reconcile(ctx context.Context, api *forgeapi.Client,
 }
 
 func (r *managedReconciler) deleteRemote(ctx context.Context, api *forgeapi.Client, object client.Object, id string) error {
+	if mirror, ok := object.(*forgev1.ForgejoPushMirror); ok {
+		// A push mirror is addressed by remote_name. A legacy or missing
+		// remoteID is resolved by the mirror's destination URL, its natural
+		// key, rather than aimed at push_mirrors/0.
+		path, err := pushMirrorDeletePath(ctx, api, mirror, id)
+		if err != nil || path == "" {
+			return err
+		}
+		if err := api.Do(ctx, http.MethodDelete, path, nil, nil); err != nil && !isNotFound(err) {
+			return err
+		}
+		return nil
+	}
 	// Without a recorded id there is nothing to address: never aim a DELETE at
 	// a collection endpoint on a guess.
 	if id == "" {
@@ -478,8 +491,6 @@ func (r *managedReconciler) deleteRemote(ctx context.Context, api *forgeapi.Clie
 		path = repoPath(v.Spec.Owner, v.Spec.Repository) + "/keys/" + id
 	case *forgev1.ForgejoWebhook:
 		path = hookBase(v.Spec.Owner, v.Spec.Repository) + "/" + id
-	case *forgev1.ForgejoPushMirror:
-		path = repoPath(v.Spec.Owner, v.Spec.Repository) + "/push_mirrors/" + id
 	case *forgev1.ForgejoBranchProtection:
 		path = repoPath(v.Spec.Owner, v.Spec.Repository) + "/branch_protections/" + esc(v.Spec.Branch)
 	case *forgev1.ForgejoTagProtection:

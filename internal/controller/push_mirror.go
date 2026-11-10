@@ -33,7 +33,8 @@ const (
 	gitRequestTimeout      = 30 * time.Second
 )
 
-// Degraded reasons for a credential rotation the guard refused.
+// Degraded reasons for a push mirror creation or credential rotation the
+// guard refused.
 const (
 	reasonMirrorSyncFailing                      = "MirrorSyncFailing"
 	reasonDestinationRefsUnreadable              = "DestinationRefsUnreadable"
@@ -41,18 +42,27 @@ const (
 	reasonDestinationHasObjectsMissingFromSource = "DestinationHasObjectsMissingFromSource"
 )
 
-// pushMirrorRotationBlockedError reports a credential rotation the guard
-// refused. Nothing was deleted or recreated; the live mirror is untouched. Its
-// ConditionReason surfaces as the Degraded reason and the reconcile requeues.
-type pushMirrorRotationBlockedError struct{ reason, message string }
+// pushMirrorBlockedError reports a push mirror creation or credential
+// rotation the guard refused. Nothing was created, deleted or recreated; the
+// live mirror, if any, is untouched. Its ConditionReason surfaces as the
+// Degraded reason and the reconcile requeues.
+type pushMirrorBlockedError struct {
+	creating        bool
+	reason, message string
+}
 
-func (e *pushMirrorRotationBlockedError) Error() string {
+func (e *pushMirrorBlockedError) Error() string {
+	if e.creating {
+		return "push mirror creation is blocked, no mirror was created: " + e.message
+	}
 	return "push mirror credential changed but rotation is blocked, the mirror was left untouched: " + e.message
 }
-func (e *pushMirrorRotationBlockedError) ConditionReason() string { return e.reason }
+func (e *pushMirrorBlockedError) ConditionReason() string { return e.reason }
 
+// remotePushMirror is one entry of Forgejo's push_mirrors listing. Forgejo
+// returns no numeric id for a push mirror (it would decode as 0): a mirror is
+// addressed by its remote_name, which is what status.remoteID records.
 type remotePushMirror struct {
-	ID            int64  `json:"id"`
 	RemoteName    string `json:"remote_name"`
 	RemoteAddress string `json:"remote_address"`
 	LastError     string `json:"last_error"`
@@ -73,15 +83,19 @@ func (r *managedReconciler) reconcilePushMirror(ctx context.Context, api *forgea
 	}
 	hash := pushMirrorCredentialHash(v.Spec.RemoteUsername, credential)
 	base := repoPath(v.Spec.Owner, v.Spec.Repository) + "/push_mirrors"
-	var mirrors []remotePushMirror
-	if err := api.Do(ctx, http.MethodGet, base, nil, &mirrors); err != nil {
+	mirror, found, err := findPushMirror(ctx, api, v)
+	if err != nil {
 		return "", err
 	}
-	for _, mirror := range mirrors {
-		if mirror.RemoteAddress != v.Spec.DestinationURL {
-			continue
+	if found {
+		// Record the mirror's real identity before anything can fail, so an
+		// object still carrying the legacy remoteID "0" (from when the
+		// nonexistent numeric id was read) is migrated even while a rotation
+		// stays blocked. This is a status write only; Forgejo is not touched.
+		id := mirror.RemoteName
+		if id != "" {
+			v.Status.RemoteID = id
 		}
-		id := strconv.FormatInt(mirror.ID, 10)
 		// Guarded credential rotation.
 		//
 		// The credential is a short-lived GitHub App installation token that
@@ -127,11 +141,11 @@ func (r *managedReconciler) reconcilePushMirror(ctx context.Context, api *forgea
 		case hash:
 			return id, nil
 		}
-		if err := r.pushMirrorRotationGuard(ctx, api, v, mirror, credential); err != nil {
-			return "", err
-		}
 		if mirror.RemoteName == "" {
 			return "", fmt.Errorf("push mirror for %s has no remote_name to delete it by", v.Spec.DestinationURL)
+		}
+		if err := r.pushMirrorRotationGuard(ctx, api, v, mirror, credential); err != nil {
+			return "", err
 		}
 		if err := api.Do(ctx, http.MethodDelete, base+"/"+esc(mirror.RemoteName), nil, nil); err != nil && !isNotFound(err) {
 			return "", fmt.Errorf("delete push mirror for rotation: %w", err)
@@ -149,6 +163,20 @@ func (r *managedReconciler) reconcilePushMirror(ctx context.Context, api *forgea
 		}
 		return newID, nil
 	}
+	// No mirror exists yet. Creating one is as dangerous as recreating one:
+	// Forgejo syncs a new mirror immediately with `git push --mirror`, which
+	// deletes every destination ref the source lacks. That is how 162 refs
+	// were lost on 2026-09-22. So creation runs the same destination check as
+	// rotation and refuses unless the destination's refs and objects are all
+	// already in Forgejo. An empty destination passes. There is no last_error
+	// to check, because there is no mirror yet.
+	if err := r.pushMirrorDestinationGuard(ctx, api, v, credential); err != nil {
+		var blocked *pushMirrorBlockedError
+		if errors.As(err, &blocked) {
+			blocked.creating = true
+		}
+		return "", err
+	}
 	newID, err := createPushMirror(ctx, api, base, v, credential)
 	if err != nil {
 		return "", err
@@ -157,10 +185,9 @@ func (r *managedReconciler) reconcilePushMirror(ctx context.Context, api *forgea
 	return newID, nil
 }
 
+// createPushMirror creates the mirror and returns its remote_name.
 func createPushMirror(ctx context.Context, api *forgeapi.Client, base string, v *forgev1.ForgejoPushMirror, credential string) (string, error) {
-	var created struct {
-		ID int64 `json:"id"`
-	}
+	var created remotePushMirror
 	payload := map[string]any{"remote_address": v.Spec.DestinationURL, "remote_password": credential, "interval": v.Spec.Interval, "sync_on_commit": v.Spec.SyncOnCommit}
 	// Only send remote_username when it is declared, so the request stays
 	// byte-identical for every mirror that does not set it.
@@ -170,7 +197,61 @@ func createPushMirror(ctx context.Context, api *forgeapi.Client, base string, v 
 	if err := api.Do(ctx, http.MethodPost, base, payload, &created); err != nil {
 		return "", err
 	}
-	return strconv.FormatInt(created.ID, 10), nil
+	if created.RemoteName != "" {
+		return created.RemoteName, nil
+	}
+	// The create response did not name the mirror: find it in the listing.
+	mirror, found, err := findPushMirror(ctx, api, v)
+	if err != nil {
+		return "", fmt.Errorf("look up created push mirror: %w", err)
+	}
+	if !found || mirror.RemoteName == "" {
+		return "", fmt.Errorf("created push mirror for %s has no remote_name", v.Spec.DestinationURL)
+	}
+	return mirror.RemoteName, nil
+}
+
+// findPushMirror returns the mirror whose remote_address is the declared
+// destination URL.
+func findPushMirror(ctx context.Context, api *forgeapi.Client, v *forgev1.ForgejoPushMirror) (remotePushMirror, bool, error) {
+	var mirrors []remotePushMirror
+	if err := api.Do(ctx, http.MethodGet, repoPath(v.Spec.Owner, v.Spec.Repository)+"/push_mirrors", nil, &mirrors); err != nil {
+		return remotePushMirror{}, false, err
+	}
+	for _, mirror := range mirrors {
+		if mirror.RemoteAddress == v.Spec.DestinationURL {
+			return mirror, true, nil
+		}
+	}
+	return remotePushMirror{}, false, nil
+}
+
+// pushMirrorDeletePath returns the path that deletes the mirror, or "" when
+// there is none. remoteID is the recorded remote_name. A legacy remoteID (all
+// digits: "0", from when a numeric id that Forgejo never returns was read) or
+// a missing one names nothing, so the mirror is looked up by its destination
+// URL instead; deleting push_mirrors/0 would 404 and silently leave the mirror.
+func pushMirrorDeletePath(ctx context.Context, api *forgeapi.Client, v *forgev1.ForgejoPushMirror, remoteID string) (string, error) {
+	name := remoteID
+	if isLegacyPushMirrorID(name) {
+		mirror, found, err := findPushMirror(ctx, api, v)
+		if err != nil {
+			return "", fmt.Errorf("look up push mirror to delete: %w", err)
+		}
+		if !found || mirror.RemoteName == "" {
+			return "", nil
+		}
+		name = mirror.RemoteName
+	}
+	return repoPath(v.Spec.Owner, v.Spec.Repository) + "/push_mirrors/" + esc(name), nil
+}
+
+func isLegacyPushMirrorID(id string) bool {
+	if id == "" {
+		return true
+	}
+	_, err := strconv.ParseUint(id, 10, 64)
+	return err == nil
 }
 
 // pushMirrorRotationGuard returns nil only when deleting and recreating the
@@ -179,14 +260,22 @@ func (r *managedReconciler) pushMirrorRotationGuard(ctx context.Context, api *fo
 	// last_error is deliberately not echoed: it is free text from git and the
 	// remote, and is not guaranteed to be credential-free.
 	if strings.TrimSpace(mirror.LastError) != "" {
-		return &pushMirrorRotationBlockedError{reason: reasonMirrorSyncFailing,
+		return &pushMirrorBlockedError{reason: reasonMirrorSyncFailing,
 			message: "the mirror's last sync failed (see last_error on the Forgejo push mirror); fix it, or delete the mirror by hand once the destination's refs are reconciled"}
 	}
+	return r.pushMirrorDestinationGuard(ctx, api, v, credential)
+}
+
+// pushMirrorDestinationGuard returns nil only when every ref the destination
+// advertises exists in Forgejo by name and its object exists in Forgejo, so a
+// `git push --mirror` from Forgejo can delete no destination ref and orphan no
+// destination object. It guards both creating a mirror and recreating one.
+func (r *managedReconciler) pushMirrorDestinationGuard(ctx context.Context, api *forgeapi.Client, v *forgev1.ForgejoPushMirror, credential string) error {
 	destination, err := readAdvertisedRefs(ctx, &http.Client{Timeout: gitRequestTimeout, Transport: r.Transport},
 		v.Spec.DestinationURL, pushMirrorRefService, v.Spec.RemoteUsername, credential)
 	if err != nil {
-		return &pushMirrorRotationBlockedError{reason: reasonDestinationRefsUnreadable,
-			message: "cannot read the destination's refs with the new credential: " + err.Error()}
+		return &pushMirrorBlockedError{reason: reasonDestinationRefsUnreadable,
+			message: "cannot read the destination's refs with the mirror's credential: " + err.Error()}
 	}
 	var sourceRefs []struct {
 		Ref    string `json:"ref"`
@@ -220,7 +309,7 @@ func (r *managedReconciler) pushMirrorRotationGuard(ctx context.Context, api *fo
 		}
 	}
 	if len(missingNames) > 0 {
-		return &pushMirrorRotationBlockedError{reason: reasonDestinationHasRefsMissingFromSource,
+		return &pushMirrorBlockedError{reason: reasonDestinationHasRefsMissingFromSource,
 			message: fmt.Sprintf("%d destination ref(s) do not exist in Forgejo and the mirror push would delete them: %s",
 				len(missingNames), summarizeRefs(missingNames))}
 	}
@@ -244,7 +333,7 @@ func (r *managedReconciler) pushMirrorRotationGuard(ctx context.Context, api *fo
 		}
 	}
 	if len(missingObjects) > 0 {
-		return &pushMirrorRotationBlockedError{reason: reasonDestinationHasObjectsMissingFromSource,
+		return &pushMirrorBlockedError{reason: reasonDestinationHasObjectsMissingFromSource,
 			message: "destination ref(s) point at objects Forgejo does not have and the mirror push would discard them: " + summarizeRefs(missingObjects)}
 	}
 	return nil

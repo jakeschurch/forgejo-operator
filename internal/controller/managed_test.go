@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"testing"
 
@@ -917,22 +918,23 @@ func TestPushMirrorCreateOmitsEmptyRemoteUsername(t *testing.T) {
 	}
 }
 
-// SAFETY: an existing mirror must be adopted read-only. Rewriting its remote
-// means delete-and-recreate, and a freshly created push mirror syncs --
-// `git push --mirror` deletes every destination ref the source lacks. That is
-// the 2026-09-22 incident in which 162 refs were destroyed on GitHub.
-func TestPushMirrorNeverRewritesExistingMirror(t *testing.T) {
+// Adopting an existing mirror (no recorded credential hash) only records the
+// hash. The credential the live mirror holds cannot be observed, so the first
+// observation is taken as the baseline and nothing is written: recreating a
+// mirror arms `git push --mirror`, which deletes every destination ref the
+// source lacks (the 2026-09-22 incident, 162 refs destroyed on GitHub).
+func TestPushMirrorAdoptRecordsHashWithoutWrites(t *testing.T) {
 	object, kube := pushMirrorFixture("x-access-token")
 	var requests []string
 	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		requests = append(requests, r.Method+" "+r.URL.Path)
 		if r.Method == http.MethodGet {
-			return response(http.StatusOK, `[{"id":5,"remote_address":"https://github.com/jakeschurch/homelab.git"}]`), nil
+			return response(http.StatusOK, `[{"id":5,"remote_name":"remote_mirror_a","remote_address":"https://github.com/jakeschurch/homelab.git","last_error":"push failed"}]`), nil
 		}
 		return response(http.StatusCreated, `{"id":9}`), nil
 	})
 	api, _ := forgeapi.New("https://forgejo.invalid", "admin", forgeapi.WithHTTPClient(&http.Client{Transport: transport}), forgeapi.WithRetries(0))
-	reconciler := managedReconciler{Reconciler: Reconciler{Client: kube}}
+	reconciler := managedReconciler{Reconciler: Reconciler{Client: kube, Transport: transport}}
 	id, err := reconciler.reconcile(context.Background(), api, object)
 	if err != nil {
 		t.Fatal(err)
@@ -940,12 +942,331 @@ func TestPushMirrorNeverRewritesExistingMirror(t *testing.T) {
 	if id != "5" {
 		t.Fatalf("id=%q, want the adopted mirror 5", id)
 	}
+	if object.Status.CredentialHash != pushMirrorCredentialHash("x-access-token", "ghp-sensitive") {
+		t.Fatalf("adoption did not record the credential hash: %q", object.Status.CredentialHash)
+	}
+	requireReadOnly(t, requests)
+}
+
+func requireReadOnly(t *testing.T, requests []string) {
+	t.Helper()
 	for _, request := range requests {
-		if strings.HasPrefix(request, http.MethodPost) || strings.HasPrefix(request, http.MethodPatch) ||
-			strings.HasPrefix(request, http.MethodPut) || strings.HasPrefix(request, http.MethodDelete) {
-			t.Fatalf("an existing push mirror was rewritten, arming a destructive sync: %v", requests)
+		if !strings.HasPrefix(request, http.MethodGet+" ") {
+			t.Fatalf("a guarded push mirror was written to: %v", requests)
 		}
 	}
+}
+
+func TestPushMirrorCreateRecordsHash(t *testing.T) {
+	object, kube := pushMirrorFixture("x-access-token")
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPost {
+			return response(http.StatusCreated, `{"id":5}`), nil
+		}
+		return response(http.StatusOK, `[]`), nil
+	})
+	api, _ := forgeapi.New("https://forgejo.invalid", "admin", forgeapi.WithHTTPClient(&http.Client{Transport: transport}), forgeapi.WithRetries(0))
+	reconciler := managedReconciler{Reconciler: Reconciler{Client: kube}}
+	if _, err := reconciler.reconcile(context.Background(), api, object); err != nil {
+		t.Fatal(err)
+	}
+	if object.Status.CredentialHash != pushMirrorCredentialHash("x-access-token", "ghp-sensitive") {
+		t.Fatalf("creation did not record the credential hash: %q", object.Status.CredentialHash)
+	}
+}
+
+func TestPushMirrorCredentialHash(t *testing.T) {
+	// printf 'x-access-token\0ghp-sensitive' | sha256sum
+	const want = "662d01a6ac39fe24db029359370f5fa7ecc9933e8b10af43e9401954dc5ff5ff"
+	got := pushMirrorCredentialHash("x-access-token", "ghp-sensitive")
+	if got != want {
+		t.Fatalf("hash=%s, want %s", got, want)
+	}
+	if got == pushMirrorCredentialHash("x-access-tokenghp", "-sensitive") ||
+		got == pushMirrorCredentialHash("", "ghp-sensitive") {
+		t.Fatalf("hash %q does not separate username from credential", got)
+	}
+}
+
+const (
+	mirrorOID1 = "1111111111111111111111111111111111111111"
+	mirrorOID2 = "2222222222222222222222222222222222222222"
+	mirrorOID3 = "3333333333333333333333333333333333333333"
+	mirrorTag  = "4444444444444444444444444444444444444444"
+	mirrorGone = "9999999999999999999999999999999999999999"
+)
+
+// mirrorWorld fakes both sides of a push mirror: the Forgejo API (source) and
+// the destination's smart-HTTP ref advertisement.
+type mirrorWorld struct {
+	lastError string
+	// destination refs advertised by receive-pack, name -> oid
+	destination map[string]string
+	// source refs returned by GET git/refs, name -> oid
+	source map[string]string
+	// objects Forgejo holds that are not ref tips
+	commits, tags map[string]bool
+	requests      []string
+	destAuthUser  string
+	destAuthPass  string
+	createPayload map[string]any
+	// destinationStatus, when set, is returned instead of an advertisement.
+	destinationStatus int
+}
+
+func pkt(s string) string { return fmt.Sprintf("%04x%s", len(s)+4, s) }
+
+func (w *mirrorWorld) transport() roundTripFunc {
+	return func(r *http.Request) (*http.Response, error) {
+		w.requests = append(w.requests, r.Method+" "+r.URL.Path)
+		if r.URL.Host == "github.com" {
+			if r.URL.Path != "/jakeschurch/homelab.git/info/refs" || r.URL.Query().Get("service") != "git-receive-pack" {
+				return response(http.StatusNotFound, ""), nil
+			}
+			w.destAuthUser, w.destAuthPass, _ = r.BasicAuth()
+			if w.destinationStatus != 0 {
+				return response(w.destinationStatus, ""), nil
+			}
+			names := make([]string, 0, len(w.destination))
+			for name := range w.destination {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			body := pkt("# service=git-receive-pack\n") + "0000"
+			for i, name := range names {
+				line := w.destination[name] + " " + name
+				if i == 0 {
+					line += "\x00report-status delete-refs ofs-delta"
+				}
+				body += pkt(line + "\n")
+			}
+			body += "0000"
+			resp := response(http.StatusOK, body)
+			resp.Header.Set("Content-Type", "application/x-git-receive-pack-advertisement")
+			return resp, nil
+		}
+		const repo = "/api/v1/repos/jake/homelab"
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == repo+"/push_mirrors":
+			lastError, _ := json.Marshal(w.lastError)
+			return response(http.StatusOK, `[{"remote_name":"remote_mirror_old","remote_address":"https://github.com/jakeschurch/homelab.git","last_error":`+string(lastError)+`}]`), nil
+		case r.Method == http.MethodGet && r.URL.Path == repo+"/git/refs":
+			type ref struct {
+				Ref    string            `json:"ref"`
+				Object map[string]string `json:"object"`
+			}
+			var refs []ref
+			for name, oid := range w.source {
+				refs = append(refs, ref{Ref: name, Object: map[string]string{"sha": oid, "type": "commit"}})
+			}
+			raw, _ := json.Marshal(refs)
+			return response(http.StatusOK, string(raw)), nil
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, repo+"/git/commits/"):
+			if w.commits[strings.TrimPrefix(r.URL.Path, repo+"/git/commits/")] {
+				return response(http.StatusOK, `{}`), nil
+			}
+			return response(http.StatusNotFound, ""), nil
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, repo+"/git/tags/"):
+			if w.tags[strings.TrimPrefix(r.URL.Path, repo+"/git/tags/")] {
+				return response(http.StatusOK, `{}`), nil
+			}
+			return response(http.StatusBadRequest, ""), nil
+		case r.Method == http.MethodDelete && r.URL.Path == repo+"/push_mirrors/remote_mirror_old":
+			return response(http.StatusNoContent, ""), nil
+		case r.Method == http.MethodPost && r.URL.Path == repo+"/push_mirrors":
+			if err := json.NewDecoder(r.Body).Decode(&w.createPayload); err != nil {
+				return nil, err
+			}
+			return response(http.StatusCreated, `{"id":9}`), nil
+		case r.Method == http.MethodPost && r.URL.Path == repo+"/push_mirrors-sync":
+			return response(http.StatusOK, ""), nil
+		}
+		return response(http.StatusTeapot, ""), nil
+	}
+}
+
+// writes returns every non-GET request the operator sent to Forgejo.
+func (w *mirrorWorld) writes() []string {
+	var out []string
+	for _, request := range w.requests {
+		if !strings.HasPrefix(request, http.MethodGet+" ") {
+			out = append(out, request)
+		}
+	}
+	return out
+}
+
+// cleanMirrorWorld is a destination that is safe to mirror over: every ref
+// exists in Forgejo, and the stale branch's older object is in Forgejo's
+// history. Forgejo being ahead is normal.
+func cleanMirrorWorld() *mirrorWorld {
+	return &mirrorWorld{
+		destination: map[string]string{
+			"refs/heads/main":  mirrorOID1,
+			"refs/heads/stale": mirrorOID2,
+			"refs/tags/v1":     mirrorTag,
+		},
+		source: map[string]string{
+			"refs/heads/main":    mirrorOID1,
+			"refs/heads/stale":   mirrorOID3,
+			"refs/heads/feature": mirrorOID3,
+			"refs/tags/v1":       mirrorTag,
+			"refs/pull/1/head":   mirrorOID3,
+		},
+		commits: map[string]bool{mirrorOID1: true, mirrorOID2: true, mirrorOID3: true},
+		tags:    map[string]bool{mirrorTag: true},
+	}
+}
+
+// runPushMirrorReconcile drives the full Reconcile (so conditions are set the
+// way production sets them) for a mirror whose recorded hash is storedHash,
+// while the Secret holds "ghp-sensitive".
+func runPushMirrorReconcile(t *testing.T, storedHash string, world *mirrorWorld) (forgev1.ForgejoPushMirror, ctrl.Result) {
+	t.Helper()
+	object, _ := pushMirrorFixture("x-access-token")
+	object.Status.CredentialHash = storedHash
+	object.Status.RemoteID = "0"
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = forgev1.AddToScheme(scheme)
+	kube := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&forgev1.ForgejoPushMirror{}).
+		WithObjects(object,
+			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "mirror-token", Namespace: "forgejo"}, Data: map[string][]byte{"token": []byte("ghp-sensitive")}},
+			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "admin-token", Namespace: "forgejo"}, Data: map[string][]byte{"token": []byte("admin")}},
+			&forgev1.ForgejoProvider{
+				ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "forgejo"},
+				Spec: forgev1.ForgejoProviderSpec{
+					URL:            "https://forgejo.invalid",
+					TokenSecretRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "admin-token"}, Key: "token"},
+				},
+			}).Build()
+	r := &managedReconciler{
+		Reconciler: Reconciler{Client: kube, Transport: world.transport()},
+		newObject:  func() client.Object { return &forgev1.ForgejoPushMirror{} },
+	}
+	key := client.ObjectKey{Namespace: "forgejo", Name: "homelab-github"}
+	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored forgev1.ForgejoPushMirror
+	if err := kube.Get(context.Background(), key, &stored); err != nil {
+		t.Fatal(err)
+	}
+	return stored, result
+}
+
+var (
+	newMirrorHash = pushMirrorCredentialHash("x-access-token", "ghp-sensitive")
+	oldMirrorHash = pushMirrorCredentialHash("x-access-token", "ghp-expired")
+)
+
+func TestPushMirrorUnchangedHashDoesNothing(t *testing.T) {
+	world := cleanMirrorWorld()
+	stored, _ := runPushMirrorReconcile(t, newMirrorHash, world)
+	if writes := world.writes(); len(writes) != 0 {
+		t.Fatalf("an unchanged credential wrote to Forgejo: %v", writes)
+	}
+	for _, request := range world.requests {
+		if strings.Contains(request, "/info/refs") || strings.Contains(request, "/git/") {
+			t.Fatalf("an unchanged credential ran the rotation guard: %v", world.requests)
+		}
+	}
+	if stored.Status.CredentialHash != newMirrorHash {
+		t.Fatalf("hash=%q", stored.Status.CredentialHash)
+	}
+	if degraded := meta.FindStatusCondition(stored.Status.Conditions, "Degraded"); degraded == nil || degraded.Status != metav1.ConditionFalse {
+		t.Fatalf("degraded=%+v", degraded)
+	}
+}
+
+func TestPushMirrorRotatesWhenGuardIsClean(t *testing.T) {
+	world := cleanMirrorWorld()
+	stored, _ := runPushMirrorReconcile(t, oldMirrorHash, world)
+	want := []string{
+		"DELETE /api/v1/repos/jake/homelab/push_mirrors/remote_mirror_old",
+		"POST /api/v1/repos/jake/homelab/push_mirrors",
+		"POST /api/v1/repos/jake/homelab/push_mirrors-sync",
+	}
+	if got := world.writes(); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("writes=%v, want %v", got, want)
+	}
+	if world.destAuthUser != "x-access-token" || world.destAuthPass != "ghp-sensitive" {
+		t.Fatalf("destination refs were not read with the NEW credential (user=%q, passwordMatch=%t)", world.destAuthUser, world.destAuthPass == "ghp-sensitive")
+	}
+	if world.createPayload["remote_username"] != "x-access-token" || world.createPayload["remote_password"] != "ghp-sensitive" ||
+		world.createPayload["remote_address"] != "https://github.com/jakeschurch/homelab.git" || world.createPayload["sync_on_commit"] != false {
+		t.Fatalf("recreate payload differs from creation: %#v", world.createPayload)
+	}
+	if stored.Status.CredentialHash != newMirrorHash || stored.Status.RemoteID != "9" {
+		t.Fatalf("hash=%q remoteID=%q after rotation", stored.Status.CredentialHash, stored.Status.RemoteID)
+	}
+	if degraded := meta.FindStatusCondition(stored.Status.Conditions, "Degraded"); degraded == nil || degraded.Status != metav1.ConditionFalse {
+		t.Fatalf("degraded=%+v", degraded)
+	}
+}
+
+// requireBlocked asserts the rotation was refused: nothing written, the old
+// hash kept so the next reconcile retries, Degraded with reason, and requeued.
+func requireBlocked(t *testing.T, world *mirrorWorld, stored forgev1.ForgejoPushMirror, result ctrl.Result, reason string, mentions ...string) {
+	t.Helper()
+	if writes := world.writes(); len(writes) != 0 {
+		t.Fatalf("a blocked rotation wrote to Forgejo: %v", writes)
+	}
+	if stored.Status.CredentialHash != oldMirrorHash {
+		t.Fatalf("a blocked rotation recorded the new hash, so it would never retry")
+	}
+	degraded := meta.FindStatusCondition(stored.Status.Conditions, "Degraded")
+	if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != reason {
+		t.Fatalf("degraded=%+v, want True/%s", degraded, reason)
+	}
+	for _, mention := range mentions {
+		if !strings.Contains(degraded.Message, mention) {
+			t.Fatalf("Degraded message %q does not name %q", degraded.Message, mention)
+		}
+	}
+	if strings.Contains(degraded.Message, "ghp-sensitive") {
+		t.Fatal("Degraded message leaks the credential")
+	}
+	if result.RequeueAfter == 0 {
+		t.Fatal("a blocked rotation must be retried")
+	}
+}
+
+func TestPushMirrorRotationBlockedWhenLastSyncFailed(t *testing.T) {
+	world := cleanMirrorWorld()
+	world.lastError = "push failed: fatal: Authentication failed"
+	stored, result := runPushMirrorReconcile(t, oldMirrorHash, world)
+	requireBlocked(t, world, stored, result, reasonMirrorSyncFailing)
+}
+
+func TestPushMirrorRotationBlockedWhenDestinationObjectMissingFromSource(t *testing.T) {
+	world := cleanMirrorWorld()
+	// Someone pushed straight to GitHub: the ref exists in Forgejo, but the
+	// destination's tip is a commit Forgejo has never seen. The mirror push
+	// would force it back and lose that commit.
+	world.destination["refs/heads/main"] = mirrorGone
+	stored, result := runPushMirrorReconcile(t, oldMirrorHash, world)
+	requireBlocked(t, world, stored, result, reasonDestinationHasObjectsMissingFromSource, "refs/heads/main")
+}
+
+func TestPushMirrorRotationBlockedWhenDestinationRefMissingFromSource(t *testing.T) {
+	world := cleanMirrorWorld()
+	// The 2026-09-22 shape: refs that only exist on GitHub.
+	world.destination["refs/heads/only-on-github"] = mirrorOID1
+	world.destination["refs/tags/only-on-github"] = mirrorOID2
+	stored, result := runPushMirrorReconcile(t, oldMirrorHash, world)
+	requireBlocked(t, world, stored, result, reasonDestinationHasRefsMissingFromSource,
+		"refs/heads/only-on-github", "refs/tags/only-on-github")
+}
+
+// A destination that refuses the new credential is not evidence of safety.
+func TestPushMirrorRotationBlockedWhenDestinationUnreadable(t *testing.T) {
+	world := cleanMirrorWorld()
+	world.destinationStatus = http.StatusUnauthorized
+	stored, result := runPushMirrorReconcile(t, oldMirrorHash, world)
+	requireBlocked(t, world, stored, result, reasonDestinationRefsUnreadable, "401")
 }
 
 const (

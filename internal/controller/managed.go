@@ -123,7 +123,7 @@ func managedFields(object client.Object) (*forgev1.CommonSpec, *forgev1.CommonSt
 	case *forgev1.ForgejoWebhook:
 		return &v.Spec.CommonSpec, &v.Status
 	case *forgev1.ForgejoPushMirror:
-		return &v.Spec.CommonSpec, &v.Status
+		return &v.Spec.CommonSpec, &v.Status.CommonStatus
 	case *forgev1.ForgejoBranchProtection:
 		return &v.Spec.CommonSpec, &v.Status
 	case *forgev1.ForgejoTagProtection:
@@ -391,46 +391,11 @@ func (r *managedReconciler) reconcile(ctx context.Context, api *forgeapi.Client,
 		err := api.Do(ctx, http.MethodPost, path, payload, &created)
 		return strconv.FormatInt(created.ID, 10), err
 	case *forgev1.ForgejoPushMirror:
-		credential, err := r.secretValue(ctx, v.Namespace, v.Spec.CredentialsSecretRef, "token")
-		if err != nil {
-			return "", err
-		}
-		path := repoPath(v.Spec.Owner, v.Spec.Repository) + "/push_mirrors"
-		var mirrors []struct {
-			ID            int64  `json:"id"`
-			RemoteAddress string `json:"remote_address"`
-		}
-		if err := api.Do(ctx, http.MethodGet, path, nil, &mirrors); err != nil {
-			return "", err
-		}
-		for _, mirror := range mirrors {
-			if mirror.RemoteAddress == v.Spec.DestinationURL {
-				// Adopt only. An existing mirror's credentials are never
-				// rewritten, for three reasons. (1) The listing returns
-				// remote_address with its credentials stripped -- that is why
-				// matching on it works at all -- so the operator cannot observe
-				// the stored username and cannot tell whether there is drift to
-				// repair. (2) Forgejo has no PATCH for a mirror's remote, so any
-				// correction is delete-and-recreate, and a freshly created push
-				// mirror SYNCS: `git push --mirror` deletes every destination
-				// ref the source lacks. That is exactly the 2026-09-22 incident
-				// in which 162 refs were destroyed on GitHub. (3) Safe
-				// sequencing -- reconcile the refs, then let it authenticate --
-				// requires a human looking at both sides.
-				return strconv.FormatInt(mirror.ID, 10), nil
-			}
-		}
-		var created struct {
-			ID int64 `json:"id"`
-		}
-		payload := map[string]any{"remote_address": v.Spec.DestinationURL, "remote_password": credential, "interval": v.Spec.Interval, "sync_on_commit": v.Spec.SyncOnCommit}
-		// Only send remote_username when it is declared, so the request stays
-		// byte-identical for every mirror that does not set it.
-		if v.Spec.RemoteUsername != "" {
-			payload["remote_username"] = v.Spec.RemoteUsername
-		}
-		err = api.Do(ctx, http.MethodPost, path, payload, &created)
-		return strconv.FormatInt(created.ID, 10), err
+		// Creates the mirror, or rotates an existing mirror's credential only
+		// behind a guard proving the recreate's `git push --mirror` cannot
+		// delete destination refs (the 2026-09-22 incident). The full safety
+		// argument is in reconcilePushMirror (push_mirror.go).
+		return r.reconcilePushMirror(ctx, api, v)
 	case *forgev1.ForgejoBranchProtection:
 		path := repoPath(v.Spec.Owner, v.Spec.Repository) + "/branch_protections/" + esc(v.Spec.Branch)
 		payload := map[string]any{"branch_name": v.Spec.Branch, "required_approvals": v.Spec.RequiredApprovals, "status_check_contexts": append([]string{}, v.Spec.RequiredStatusContexts...), "enable_status_check": len(v.Spec.RequiredStatusContexts) > 0, "enable_push": v.Spec.EnablePush, "enable_merge_whitelist": v.Spec.EnableMerge}

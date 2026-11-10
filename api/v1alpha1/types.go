@@ -242,8 +242,11 @@ type PushMirrorSpec struct {
 	// is what ARMS that first destructive sync. Reconcile the source's refs
 	// with the destination's BEFORE this value reaches a live mirror.
 	//
-	// This is applied only when the mirror is CREATED. The operator never
-	// rewrites an existing mirror's credentials; see reconcile() for why.
+	// Changing this value, like changing the referenced credential, rotates
+	// the mirror (delete and recreate) only once the operator has proved that
+	// the destination holds no ref whose name or object is missing from the
+	// source and that the mirror's last sync succeeded; otherwise the mirror is
+	// left untouched and the resource reports Degraded. See reconcile().
 	// +optional
 	RemoteUsername string `json:"remoteUsername,omitempty"`
 }
@@ -413,8 +416,20 @@ type ForgejoWebhookList struct {
 type ForgejoPushMirror struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
-	Spec              PushMirrorSpec `json:"spec"`
-	Status            CommonStatus   `json:"status,omitempty"`
+	Spec              PushMirrorSpec   `json:"spec"`
+	Status            PushMirrorStatus `json:"status,omitempty"`
+}
+
+// PushMirrorStatus is CommonStatus plus the fingerprint of the credential the
+// live Forgejo mirror was last created or observed with.
+type PushMirrorStatus struct {
+	CommonStatus `json:",inline"`
+	// CredentialHash is the hex SHA-256 of remoteUsername + NUL + credential
+	// that the live mirror holds. Forgejo never returns a mirror's stored
+	// credential, so this is how a rotation of the referenced Secret is
+	// detected. It never contains the credential itself.
+	// +optional
+	CredentialHash string `json:"credentialHash,omitempty"`
 }
 
 // +kubebuilder:object:root=true

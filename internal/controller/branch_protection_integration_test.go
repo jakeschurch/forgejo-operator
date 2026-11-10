@@ -106,3 +106,75 @@ func TestIntegrationBranchProtectionEnforcesChecksAndAllowsQueuePush(t *testing.
 	object.Spec.RequiredStatusContexts = nil
 	reconcile(false)
 }
+
+// A push allowlist must hold against real Forgejo: the allowlisted bot pushes
+// the protected branch directly, and any other writer (here the site admin) is
+// refused and has to land through a pull request.
+func TestIntegrationBranchProtectionPushAllowlist(t *testing.T) {
+	f := startForgejo(t)
+	harness := newOperatorHarness(t, f)
+	api := f.client(t, f.providerToken)
+	ctx := context.Background()
+	const name, bot = "push-allowlist", "allowed-bot"
+	path := "repos/" + integrationAdmin + "/" + name
+	if err := api.Do(ctx, http.MethodPost, "user/repos", map[string]any{"name": name, "auto_init": true, "default_branch": "main"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	f.createUser(t, bot)
+	if err := api.Do(ctx, http.MethodPut, path+"/collaborators/"+bot, map[string]any{"permission": "write"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	object := &forgev1.ForgejoBranchProtection{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: integrationNamespace},
+		Spec:       forgev1.BranchProtectionSpec{CommonSpec: forgev1.CommonSpec{ProviderRef: "default"}, Owner: integrationAdmin, Repository: name, Branch: "main", EnablePush: true, PushAllowlistUsers: []string{bot}},
+	}
+	reconciler := &managedReconciler{Reconciler: Reconciler{Client: harness.kube}}
+	if _, err := reconciler.reconcile(ctx, api, object); err != nil {
+		t.Fatal(err)
+	}
+	var protection struct {
+		EnablePushWhitelist bool     `json:"enable_push_whitelist"`
+		Usernames           []string `json:"push_whitelist_usernames"`
+	}
+	if err := api.Do(ctx, http.MethodGet, path+"/branch_protections/main", nil, &protection); err != nil {
+		t.Fatal(err)
+	}
+	if !protection.EnablePushWhitelist || len(protection.Usernames) != 1 || protection.Usernames[0] != bot {
+		t.Fatalf("push allowlist not reconciled: %+v", protection)
+	}
+	parent := t.TempDir()
+	push := func(user, file string) error {
+		t.Helper()
+		directory := filepath.Join(parent, user)
+		run := func(arguments ...string) ([]byte, error) {
+			command := exec.Command("git", arguments...)
+			basic := base64.StdEncoding.EncodeToString([]byte(user + ":" + integrationPassword))
+			command.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_COUNT=3", "GIT_CONFIG_KEY_0=http.extraHeader", "GIT_CONFIG_VALUE_0=Authorization: Basic "+basic, "GIT_CONFIG_KEY_1=user.name", "GIT_CONFIG_VALUE_1="+user, "GIT_CONFIG_KEY_2=user.email", "GIT_CONFIG_VALUE_2="+user+"@example.invalid")
+			return command.CombinedOutput()
+		}
+		for _, step := range [][]string{
+			{"clone", "--quiet", f.url + "/" + integrationAdmin + "/" + name + ".git", directory},
+		} {
+			if out, err := run(step...); err != nil {
+				t.Fatalf("git %v: %v: %s", step, err, out)
+			}
+		}
+		if err := os.WriteFile(filepath.Join(directory, file), []byte(file+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		for _, step := range [][]string{{"-C", directory, "add", file}, {"-C", directory, "commit", "-qm", file}} {
+			if out, err := run(step...); err != nil {
+				t.Fatalf("git %v: %v: %s", step, err, out)
+			}
+		}
+		out, err := run("-C", directory, "push", "origin", "main")
+		t.Logf("%s push: %s", user, out)
+		return err
+	}
+	if err := push(integrationAdmin, "admin.txt"); err == nil {
+		t.Fatal("a writer outside the push allowlist pushed the protected branch")
+	}
+	if err := push(bot, "bot.txt"); err != nil {
+		t.Fatalf("allowlisted bot could not push: %v", err)
+	}
+}

@@ -62,6 +62,19 @@ spec:
                 type: string
               prune:
                 type: boolean
+              pushAllowlistDeployKeys:
+                description: |-
+                  PushAllowlistDeployKeys, with an allowlist, also lets the repository's
+                  write deploy keys push. Forgejo has no per-key list: it is all or none.
+                type: boolean
+              pushAllowlistUsers:
+                description: |-
+                  PushAllowlistUsers, with enablePush, limits direct pushes to these users;
+                  everyone else lands through a pull request. Empty leaves push open to all
+                  writers.
+                items:
+                  type: string
+                type: array
               repository:
                 type: string
               requiredApprovals:

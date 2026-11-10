@@ -1821,3 +1821,56 @@ func TestAccessTokenFailedDeleteIsReportedAndRetried(t *testing.T) {
 		t.Fatalf("Secret was deleted although the token was not revoked: %v", err)
 	}
 }
+
+func branchProtectionPayload(t *testing.T, spec forgev1.BranchProtectionSpec) map[string]any {
+	t.Helper()
+	object := &forgev1.ForgejoBranchProtection{
+		ObjectMeta: metav1.ObjectMeta{Name: "v1", Namespace: "forgejo"},
+		Spec:       spec,
+	}
+	var sent map[string]any
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodGet {
+			return response(http.StatusNotFound, `{}`), nil
+		}
+		if err := json.NewDecoder(r.Body).Decode(&sent); err != nil {
+			return nil, err
+		}
+		return response(http.StatusCreated, `{}`), nil
+	})
+	api, _ := forgeapi.New("https://forgejo.invalid", "admin", forgeapi.WithHTTPClient(&http.Client{Transport: transport}), forgeapi.WithRetries(0))
+	reconciler := managedReconciler{}
+	if _, err := reconciler.reconcile(context.Background(), api, object); err != nil {
+		t.Fatal(err)
+	}
+	return sent
+}
+
+// homelab v1: only the allowlisted bots and write deploy keys push directly;
+// everyone else, alert agents included, lands through a pull request.
+func TestBranchProtectionSendsPushAllowlist(t *testing.T) {
+	sent := branchProtectionPayload(t, forgev1.BranchProtectionSpec{
+		Owner: "jake", Repository: "homelab", Branch: "v1", EnablePush: true,
+		PushAllowlistUsers: []string{"argocd-tag-updater"}, PushAllowlistDeployKeys: true,
+	})
+	if sent["enable_push"] != true || sent["enable_push_whitelist"] != true || sent["push_whitelist_deploy_keys"] != true {
+		t.Fatalf("push whitelist not enabled: %#v", sent)
+	}
+	users, _ := sent["push_whitelist_usernames"].([]any)
+	if len(users) != 1 || users[0] != "argocd-tag-updater" {
+		t.Fatalf("push_whitelist_usernames=%#v", sent["push_whitelist_usernames"])
+	}
+}
+
+// An undeclared allowlist must leave the wire payload exactly as it was, so
+// existing rules (margo's queue protections) are not disturbed.
+func TestBranchProtectionOmitsEmptyPushAllowlist(t *testing.T) {
+	sent := branchProtectionPayload(t, forgev1.BranchProtectionSpec{
+		Owner: "jake", Repository: "margo", Branch: "main", EnablePush: true,
+	})
+	for _, key := range []string{"enable_push_whitelist", "push_whitelist_usernames", "push_whitelist_deploy_keys"} {
+		if _, ok := sent[key]; ok {
+			t.Fatalf("payload carried %s without a declared allowlist: %#v", key, sent)
+		}
+	}
+}

@@ -399,6 +399,14 @@ func (r *managedReconciler) reconcile(ctx context.Context, api *forgeapi.Client,
 	case *forgev1.ForgejoBranchProtection:
 		path := repoPath(v.Spec.Owner, v.Spec.Repository) + "/branch_protections/" + esc(v.Spec.Branch)
 		payload := map[string]any{"branch_name": v.Spec.Branch, "required_approvals": v.Spec.RequiredApprovals, "status_check_contexts": append([]string{}, v.Spec.RequiredStatusContexts...), "enable_status_check": len(v.Spec.RequiredStatusContexts) > 0, "enable_push": v.Spec.EnablePush, "enable_merge_whitelist": v.Spec.EnableMerge}
+		// Only send the push allowlist when one is declared, so the request stays
+		// byte-identical for every rule that does not use it. The field names are
+		// Forgejo's API; the allowlist is enable_push_whitelist and friends.
+		if len(v.Spec.PushAllowlistUsers) > 0 || v.Spec.PushAllowlistDeployKeys {
+			payload["enable_push_whitelist"] = true
+			payload["push_whitelist_usernames"] = append([]string{}, v.Spec.PushAllowlistUsers...)
+			payload["push_whitelist_deploy_keys"] = v.Spec.PushAllowlistDeployKeys
+		}
 		var remote map[string]any
 		err := api.Do(ctx, http.MethodGet, path, nil, &remote)
 		if isNotFound(err) {

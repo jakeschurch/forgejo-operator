@@ -261,6 +261,13 @@ type BranchProtectionSpec struct {
 	RequiredStatusContexts []string `json:"requiredStatusContexts,omitempty"`
 	EnablePush             bool     `json:"enablePush,omitempty"`
 	EnableMerge            bool     `json:"enableMerge,omitempty"`
+	// PushAllowlistUsers, with enablePush, limits direct pushes to these users;
+	// everyone else lands through a pull request. Empty leaves push open to all
+	// writers.
+	PushAllowlistUsers []string `json:"pushAllowlistUsers,omitempty"`
+	// PushAllowlistDeployKeys, with an allowlist, also lets the repository's
+	// write deploy keys push. Forgejo has no per-key list: it is all or none.
+	PushAllowlistDeployKeys bool `json:"pushAllowlistDeployKeys,omitempty"`
 }
 
 // +kubebuilder:validation:XValidation:rule="self.providerRef == oldSelf.providerRef && self.owner == oldSelf.owner && self.repository == oldSelf.repository && self.pattern == oldSelf.pattern",message="remote identity fields are immutable"

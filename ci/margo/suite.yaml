@@ -1,0 +1,40 @@
+# Native checks qualified before queue activation; every selected check blocks landing.
+#
+# Homelab renders this file (vmetal/ci/margo-checks/sourced/forgejo-operator).
+# nix:build builds the flake attribute of the operator image (packages.image),
+# the same package the main-branch oci-image-build pushes, so the queue probe
+# and the main build share one derivation.
+apiVersion: ci.foundrybox.dev/v1alpha1
+kind: CheckSuite
+metadata:
+  name: forgejo-operator-checks
+  namespace: argo
+spec:
+  repositoryRef:
+    name: forgejo-operator
+    namespace: forgejo
+  context: margo/forgejo-operator-checks
+  checkout:
+    url: ssh://git@forgejo-ssh.forgejo.svc.cluster.local:22/jake/forgejo-operator.git
+    deployKeySecret: forgejo-operator-margo-readonly
+  checks:
+    - name: go:test
+      template: go-test
+      kind: test
+    - name: go:vet
+      template: go-vet
+    - name: generate:drift
+      template: generate-drift
+      params:
+        command: >-
+          CGO_ENABLED=0 go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.16.5 &&
+          make generate
+    - name: helm:chart
+      template: helm-lint
+      params:
+        chart: charts/forgejo-operator
+    - name: nix:build
+      template: nix-build
+      required: true
+      params:
+        attr: .#image

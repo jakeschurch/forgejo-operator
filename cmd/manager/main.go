@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
+	"fmt"
+	"net/http"
 	"os"
+	"time"
 
 	forgev1 "github.com/jakeschurch/forgejo-operator/api/v1alpha1"
 	"github.com/jakeschurch/forgejo-operator/internal/controller"
@@ -51,10 +55,24 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	if manager.AddHealthzCheck("healthz", healthz.Ping) != nil || manager.AddReadyzCheck("readyz", healthz.Ping) != nil {
+	// 2026-11-11: readiness includes cache initialization and shutdown, including
+	// healthy election standbys; liveness must survive remote dependency outages.
+	ctx := ctrl.SetupSignalHandler()
+	ready := func(request *http.Request) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		probeCtx, cancel := context.WithTimeout(request.Context(), time.Second)
+		defer cancel()
+		if !manager.GetCache().WaitForCacheSync(probeCtx) {
+			return fmt.Errorf("cache not synchronized")
+		}
+		return ctx.Err()
+	}
+	if manager.AddHealthzCheck("healthz", healthz.Ping) != nil || manager.AddReadyzCheck("readyz", ready) != nil {
 		os.Exit(1)
 	}
-	if err := manager.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := manager.Start(ctx); err != nil {
 		os.Exit(1)
 	}
 }

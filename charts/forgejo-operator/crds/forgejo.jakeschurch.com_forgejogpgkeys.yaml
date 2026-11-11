@@ -213,8 +213,8 @@ spec:
                 type: string
               managedKeyIDs:
                 description: |-
-                  ManagedKeyIDs is the durable cleanup journal, written before registration.
-                  It includes staged and retiring keys so deletion also works without a Secret.
+                  ManagedKeyIDs mirrors protected ForgejoGPGKeyState for humans.
+                  Status is never trusted for registration, rotation, retirement or deletion.
                 items:
                   type: string
                 type: array

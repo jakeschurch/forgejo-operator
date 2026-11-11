@@ -4,7 +4,7 @@ metadata:
   name: {{ include "forgejo-operator.name" . }}
 rules:
   - apiGroups: ["forgejo.jakeschurch.com"]
-    resources: ["*"]
+    resources: ["forgejoproviders", "forgejoorganizations", "forgejorepositories", "forgejoaccesstokens", "forgejobranchprotections", "forgejocollaborators", "forgejodeploykeys", "forgejogpgkeys", "forgejolabels", "forgejomemberships", "forgejopushmirrors", "forgejorobotaccounts", "forgejotagprotections", "forgejoteams", "forgejowebhooks"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["forgejo.jakeschurch.com"]
     resources: ["*/status", "*/finalizers"]
@@ -51,23 +51,24 @@ subjects:
     name: {{ include "forgejo-operator.name" . }}
     namespace: {{ .Release.Namespace }}
 ---
-# 2026-11-11: minting provenance is writable only in the operator namespace.
+# 2026-11-11: only this SA may write the cluster-scoped GPG trust root.
+# Do not add aggregate-to-admin/edit/view labels or bind other principals.
 apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
+kind: ClusterRole
 metadata:
   name: {{ include "forgejo-operator.name" . }}-gpg-state
 rules:
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["get", "create", "update"]
+  - apiGroups: ["forgejo.jakeschurch.com"]
+    resources: ["forgejogpgkeystates"]
+    verbs: ["get", "create", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+kind: ClusterRoleBinding
 metadata:
   name: {{ include "forgejo-operator.name" . }}-gpg-state
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: Role
+  kind: ClusterRole
   name: {{ include "forgejo-operator.name" . }}-gpg-state
 subjects:
   - kind: ServiceAccount

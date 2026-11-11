@@ -46,6 +46,36 @@ class RolloutContractTest(unittest.TestCase):
                 self.assertEqual(manager["lifecycle"]["preStop"], {"sleep": {"seconds": 5}})
                 self.assertIn({"name": "health", "containerPort": 8081}, manager["ports"])
 
+    def test_gpg_trust_root_rbac(self):
+        output = subprocess.check_output(
+            ["helm", "template", "test", str(CHART), "--namespace", "operator-system"],
+            text=True,
+        )
+        documents = [doc for doc in yaml.safe_load_all(output) if doc]
+        roles = {doc["metadata"]["name"]: doc for doc in documents if doc["kind"] == "ClusterRole"}
+        state_roles = []
+        for name, role in roles.items():
+            self.assertFalse(any(label.startswith("rbac.authorization.k8s.io/aggregate-to-")
+                                 for label in role["metadata"].get("labels", {})))
+            for rule in role["rules"]:
+                if "forgejo.jakeschurch.com" in rule["apiGroups"]:
+                    self.assertNotIn("*", rule["resources"])
+                    if "forgejogpgkeystates" in rule["resources"]:
+                        self.assertEqual(rule["resources"], ["forgejogpgkeystates"])
+                        self.assertEqual(set(rule["verbs"]), {"get", "create", "update", "patch"})
+                        state_roles.append(name)
+        self.assertEqual(len(state_roles), 1)
+        bindings = [doc for doc in documents if doc["kind"] == "ClusterRoleBinding"
+                    and doc["roleRef"]["name"] == state_roles[0]]
+        self.assertEqual(len(bindings), 1)
+        accounts = [doc for doc in documents if doc["kind"] == "ServiceAccount"]
+        self.assertEqual(len(accounts), 1)
+        self.assertEqual(bindings[0]["subjects"], [{
+            "kind": "ServiceAccount", "name": accounts[0]["metadata"]["name"], "namespace": "operator-system",
+        }])
+        state_crd = yaml.safe_load((CHART / "crds/forgejo.jakeschurch.com_forgejogpgkeystates.yaml").read_text())
+        self.assertEqual(state_crd["spec"]["scope"], "Cluster")
+
 
 if __name__ == "__main__":
     unittest.main()

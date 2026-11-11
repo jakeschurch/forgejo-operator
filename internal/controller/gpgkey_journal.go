@@ -6,30 +6,35 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 
 	forgev1 "github.com/jakeschurch/forgejo-operator/api/v1alpha1"
 	"github.com/jakeschurch/forgejo-operator/internal/credentials"
+	forgeapi "github.com/jakeschurch/forgejo-operator/internal/forgejo"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// 2026-11-11: ownerReferences, CR status and tenant Secret annotations are
-// writable by tenants. Only this operator-namespace record proves minting.
-// It contains public fingerprints, never private material. Protect this
-// namespace with RBAC just as strictly as the operator service account.
+// 2026-11-11: RBAC on this dedicated cluster-scoped resource is the trust
+// boundary. ConfigMap/Secret writers (including reflectors) cannot mint state.
+const gpgSourceUID = "forgejo.jakeschurch.com/gpg-source-uid"
+const gpgSourceName = "forgejo.jakeschurch.com/gpg-source-name"
+const gpgSourceNamespace = "forgejo.jakeschurch.com/gpg-source-namespace"
+const gpgStateOperator = "forgejo.jakeschurch.com/gpg-state-operator"
+const maxGPGMinted = 8
+
 type gpgJournal struct {
-	Minted    map[string]string `json:"minted"`
-	CurrentID string            `json:"currentID,omitempty"`
-	PendingID string            `json:"pendingID,omitempty"`
+	forgev1.GPGKeyStateSpec
+	record *forgev1.ForgejoGPGKeyState
 }
 
 func (r *GPGKeyReconciler) journalKey(key *forgev1.ForgejoGPGKey) (client.ObjectKey, error) {
 	if r.StateNamespace == "" || key.UID == "" {
 		return client.ObjectKey{}, errors.New("operator namespace and CR UID are required for GPG provenance")
 	}
-	return client.ObjectKey{Namespace: r.StateNamespace, Name: fmt.Sprintf("forgejo-gpg-%x", sha256.Sum256([]byte(key.UID)))}, nil
+	return client.ObjectKey{Name: fmt.Sprintf("forgejo-gpg-%x", sha256.Sum256([]byte(key.UID)))}, nil
 }
 
 func (r *GPGKeyReconciler) readGPGJournal(ctx context.Context, key *forgev1.ForgejoGPGKey) (*gpgJournal, error) {
@@ -41,48 +46,64 @@ func (r *GPGKeyReconciler) readGPGJournal(ctx context.Context, key *forgev1.Forg
 	if reader == nil {
 		reader = r.Client
 	}
-	var record corev1.ConfigMap
+	var record forgev1.ForgejoGPGKeyState
 	if err := reader.Get(ctx, ref, &record); apierrors.IsNotFound(err) {
-		return &gpgJournal{Minted: map[string]string{}}, nil
+		// Reserve the name before authorization, Secret reads or remote requests.
+		record = forgev1.ForgejoGPGKeyState{ObjectMeta: metav1.ObjectMeta{
+			Name: ref.Name, CreationTimestamp: metav1.Now(),
+			Annotations: map[string]string{gpgSourceUID: string(key.UID), gpgSourceName: key.Name, gpgSourceNamespace: key.Namespace, gpgStateOperator: r.StateNamespace},
+		}, Spec: forgev1.GPGKeyStateSpec{Minted: map[string]string{}}}
+		if err := r.Create(ctx, &record); err != nil {
+			return nil, err
+		}
 	} else if err != nil {
 		return nil, err
 	}
-	var journal gpgJournal
-	if err := json.Unmarshal([]byte(record.Data["journal"]), &journal); err != nil || journal.Minted == nil {
-		return nil, errors.New("invalid operator GPG provenance record")
+	// Namespaced owners on cluster objects are invalid in Kubernetes. Bind the
+	// source through annotations instead; no foreign owner references are allowed.
+	if record.Annotations[gpgSourceUID] != string(key.UID) || record.Annotations[gpgSourceName] != key.Name || record.Annotations[gpgSourceNamespace] != key.Namespace || record.Annotations[gpgStateOperator] != r.StateNamespace || len(record.OwnerReferences) != 0 || record.CreationTimestamp.IsZero() || record.CreationTimestamp.Before(&key.CreationTimestamp) || !record.DeletionTimestamp.IsZero() {
+		return nil, errors.New("refusing foreign or pre-existing GPG provenance state")
 	}
-	return &journal, nil
+	if record.Spec.Minted == nil {
+		record.Spec.Minted = map[string]string{}
+	}
+	return &gpgJournal{GPGKeyStateSpec: *record.Spec.DeepCopy(), record: &record}, nil
 }
 
 func (r *GPGKeyReconciler) writeGPGJournal(ctx context.Context, key *forgev1.ForgejoGPGKey, journal *gpgJournal) error {
-	ref, err := r.journalKey(key)
-	if err != nil {
+	// Use the resourceVersion read with this transaction: a stale writer must
+	// conflict, never overwrite newer provenance or lifecycle deadlines.
+	record := journal.record.DeepCopy()
+	record.Spec = *journal.GPGKeyStateSpec.DeepCopy()
+	if err := r.Update(ctx, record); err != nil {
 		return err
 	}
-	reader := r.StateReader
-	if reader == nil {
-		reader = r.Client
+	journal.record = record
+	return nil
+}
+
+func (j *gpgJournal) lifecycle() gpgState {
+	state := gpgState{CreatedAt: j.CreatedAt.Time.UTC()}
+	for _, old := range j.Retiring {
+		state.Retiring = append(state.Retiring, gpgRetiring{KeyID: old.KeyID, RemoveAfter: old.RemoveAfter.Time.UTC()})
 	}
-	var record corev1.ConfigMap
-	err = reader.Get(ctx, ref, &record)
-	if err != nil && !apierrors.IsNotFound(err) {
-		return err
+	return state
+}
+
+func (j *gpgJournal) setLifecycle(state gpgState) {
+	j.CreatedAt = metav1.NewTime(state.CreatedAt)
+	j.Retiring = nil
+	for _, old := range state.Retiring {
+		j.Retiring = append(j.Retiring, forgev1.GPGKeyRetirement{KeyID: old.KeyID, RemoveAfter: metav1.NewTime(old.RemoveAfter)})
 	}
-	data, errJSON := json.Marshal(journal)
-	if errJSON != nil {
-		return errJSON
-	}
-	if apierrors.IsNotFound(err) {
-		record = corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: ref.Name, Namespace: ref.Namespace}, Data: map[string]string{"journal": string(data)}}
-		return r.Create(ctx, &record)
-	}
-	record.Data["journal"] = string(data)
-	return r.Update(ctx, &record)
 }
 
 // Called only with material just generated in this process, before publishing
 // either a Secret or a public key. No Secret/status recovery may call this.
 func (r *GPGKeyReconciler) mintGPGJournal(ctx context.Context, key *forgev1.ForgejoGPGKey, journal *gpgJournal, material *credentials.GPGKey) error {
+	if len(journal.Minted) >= maxGPGMinted {
+		return errors.New("GPG minting limit reached; waiting for retirement")
+	}
 	journal.Minted[material.KeyID] = material.Fingerprint
 	journal.PendingID = material.KeyID
 	return r.writeGPGJournal(ctx, key, journal)
@@ -108,4 +129,80 @@ func (r *GPGKeyReconciler) gpgTampered(key *forgev1.ForgejoGPGKey) error {
 		r.Recorder.Event(key, corev1.EventTypeWarning, "SecretTampered", message)
 	}
 	return errors.New(message)
+}
+
+func (j *gpgJournal) ids() []string {
+	ids := make([]string, 0, len(j.Minted))
+	for id := range j.Minted {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+func (r *GPGKeyReconciler) warnGPGMirrors(key *forgev1.ForgejoGPGKey, secret *corev1.Secret, journal *gpgJournal) {
+	unknown := journal.validateIDs(key.Status.ManagedKeyIDs) != nil || (key.Status.KeyID != "" && journal.Minted[key.Status.KeyID] == "")
+	var mirror gpgState
+	if raw := secret.Annotations[gpgStateAnnotation]; raw != "" {
+		if json.Unmarshal([]byte(raw), &mirror) != nil {
+			unknown = true
+		}
+		for _, old := range mirror.Retiring {
+			if journal.Minted[old.KeyID] == "" {
+				unknown = true
+			}
+		}
+	}
+	if unknown && r.Recorder != nil {
+		r.Recorder.Event(key, corev1.EventTypeWarning, "UntrustedGPGMirror", "ignored unknown GPG IDs or invalid lifecycle mirror; restoring from protected state")
+	}
+}
+
+// Prune only after idempotent remote removal succeeds. The bound also limits
+// repeated initial-publication failures while their grace deadlines elapse.
+func (r *GPGKeyReconciler) retireGPG(ctx context.Context, api *forgeapi.Client, key *forgev1.ForgejoGPGKey, journal *gpgJournal, current string) error {
+	for _, old := range slices.Clone(journal.Retiring) {
+		if old.KeyID == current || (current != "" && old.KeyID == journal.PendingID) || r.now().Before(old.RemoveAfter.Time) {
+			continue
+		}
+		if err := r.removeGPG(ctx, api, key, []string{old.KeyID}); err != nil {
+			return err
+		}
+		delete(journal.Minted, old.KeyID)
+		journal.Retiring = slices.DeleteFunc(journal.Retiring, func(v forgev1.GPGKeyRetirement) bool { return v.KeyID == old.KeyID })
+		if journal.CurrentID == old.KeyID {
+			journal.CurrentID = ""
+		}
+		if journal.PendingID == old.KeyID {
+			journal.PendingID = ""
+		}
+		if err := r.writeGPGJournal(ctx, key, journal); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *GPGKeyReconciler) revokeGPG(ctx context.Context, key *forgev1.ForgejoGPGKey, journal *gpgJournal) error {
+	ids := journal.ids()
+	if len(ids) == 0 {
+		return nil
+	}
+	api, err := r.providerClient(ctx, gpgProviderNS(key), key.Spec.ProviderRef)
+	if err != nil {
+		return err
+	}
+	if err := r.removeGPG(ctx, api, key, ids); err != nil {
+		return err
+	}
+	// Current/staged fingerprints still authenticate local private material if
+	// authorization returns. Removed historical keys must never be re-armed.
+	for id := range journal.Minted {
+		if id != journal.CurrentID && id != journal.PendingID {
+			delete(journal.Minted, id)
+		}
+	}
+	journal.Retiring = nil
+	key.Status.ManagedKeyIDs = journal.ids()
+	return r.writeGPGJournal(ctx, key, journal)
 }

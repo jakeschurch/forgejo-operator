@@ -77,14 +77,18 @@ retires the previous proven key after grace.
 Only the public key is sent to Forgejo. Missing remote keys are re-registered
 without changing private material. Deleting a key in the Forgejo UI is therefore
 not revocation: delete its Kubernetes Secret to generate a replacement, or delete
-the CR with `deletionPolicy: Delete` to remove all its managed public keys. Status adds `keyID`, `fingerprint`,
-`KeyRegistered`, `EmailVerified` and a public key-ID cleanup journal.
+the CR with `deletionPolicy: Delete` to remove all its managed public keys. Status mirrors `keyID`, `fingerprint`,
+`KeyRegistered`, `EmailVerified` and the live public key IDs for humans. It never
+authorizes registration, rotation or deletion.
 
 Omit `rotation.after` to disable automatic rotation. Both durations must be
 positive; the grace defaults to 24h. A pending private key is persisted under the
 reserved `forgejoPendingPrivateKey` data key before registration; promotion
-atomically replaces the four outputs and stores a retirement deadline in the
-`forgejo.jakeschurch.com/gpg-state` annotation. Restarts replay this transaction.
+atomically replaces the four outputs. The protected state stores the rotation
+clock and retirement deadlines **before** promotion. The
+`forgejo.jakeschurch.com/gpg-state` Secret annotation is a display mirror only;
+edits, malformed JSON and unknown IDs are ignored and repaired. Restarts replay
+this transaction without resetting grace.
 Rotation waits for previous retirement before producing another candidate.
 Consumers should reference only `privateKey`, rather than mount the entire
 Secret or use `envFrom`, which also exposes the staged private key.
@@ -95,23 +99,52 @@ Consumers using environment variables need a new pod to read the rotated key.
 Set grace longer than any outstanding signing run or queued head: removing an
 old public key also ends Forgejo verification of its historical signatures.
 Secret loss generates a replacement and retires keys from the durable journal.
-Public minting fingerprints and active/staged IDs are persisted before any
-registration in `forgejo-gpg-<sha256(CR UID)>` ConfigMaps in the operator's own
-namespace (`POD_NAMESPACE`, injected by the chart). These records contain no
-private keys. Keep this namespace restricted to operator administrators; tenant
-Secret and CR status permissions must not grant access to these ConfigMaps.
-Records are retained for audit/recovery after CR deletion. Back them up with the
-operator namespace: losing a record fails closed for existing Secrets and
-unproven cleanup IDs, rather than adopting them. Pre-provenance Secrets are also
-refused; recreate the CR and its Secret to mint a new key, and clean up old
-unproven remote keys manually. If status is lost during grace, recovery accepts only retirement
-entries with matching operator minting provenance. Status or annotation entries
-for unknown IDs can never authorize deletion.
+2026-11-11: public minting fingerprints, current/pending IDs, rotation clock,
+retirement deadlines and the deauthorization debounce are persisted in the
+cluster-scoped `ForgejoGPGKeyState` CRD (`forgejo.jakeschurch.com/v1alpha1`), named
+`forgejo-gpg-<sha256(CR UID)>`. An empty record is reserved on the CR's first
+reconcile, before authorization or any remote request. The old ConfigMap journal
+is unused and has no migration path: this feature is unreleased. State contains
+no private material and is read directly from the API, with resource-version
+conflicts preventing stale updates.
+
+**The operator ServiceAccount must be the only non-administrator principal with
+create/update/patch/delete access to `forgejogpgkeystates`.** Do not grant these
+verbs to tenants, reflectors, workload controllers, broad API-group writers or
+aggregated admin/edit/view roles. The chart binds a dedicated, unaggregated
+ClusterRole only to the operator ServiceAccount. Ordinary namespace permissions
+on Secrets and ConfigMaps cannot write this cluster-scoped resource. Kubernetes
+cluster administrators remain trusted and can change RBAC. Audit pre-existing
+cluster-wide wildcard grants before deployment.
+
+Kubernetes disallows a namespaced owner for a cluster-scoped resource. State
+therefore binds the source CR's UID, namespace and name plus the operator
+namespace through checked annotations. Reads refuse any owner reference,
+mismatched binding, deletion in progress, or state predating the CR. These checks
+are defense in depth; annotations do not identify a writer. RBAC is the trust
+root. `POD_NAMESPACE` identifies the operator deployment and is injected by the
+chart. If it is empty, only the GPG controller is disabled with a log message;
+other controllers still start.
+
+Records are retained after CR deletion for audit. Back them up with cluster
+resources. Losing a record fails closed for an existing Secret, rather than
+adopting it. Delete the Secret to mint a replacement, and clean up any unproven
+remote keys manually. Status wipes recover from protected current/pending and
+not-yet-removed IDs, never from tenant annotations or historical removed keys.
+Unknown mirror IDs produce a warning and are filtered without blocking normal
+reconciliation. Confirmed remote retirement prunes fingerprints; at most eight
+live fingerprints are retained, bounding repeated publication failures. Minting
+waits at the cap until protected retirement deadlines permit cleanup.
 `deletionPolicy` defaults to `Orphan`: no finalizer, remote public keys retained,
 and Kubernetes garbage collects the owned Secret. `Delete` removes only this
 CR's proven journaled keys and holds its finalizer on API failures. Removing a
 user/namespace from the provider allowlist, disabling GPG management, or promoting
 the target to administrator revokes its journaled keys even with `Orphan` policy.
+Policy removal must persist across two consecutive unauthorized observations at
+least 60 seconds apart before revocation. An authorized or indeterminate
+observation resets the persisted debounce; retries occur after one minute.
+Confirmed administrator promotion revokes immediately. A transient policy blip
+therefore pauses management without immediately losing signature verification.
 Revocation and `Delete` cleanup bypass creation authorization and never touch
 unproven keys. A never-authorized CR with an empty journal can delete without a
 provider. Switch to `Orphan`

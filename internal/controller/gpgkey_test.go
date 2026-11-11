@@ -46,7 +46,7 @@ func newGPGFixture(t *testing.T) *gpgFixture {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	_ = forgev1.AddToScheme(scheme)
-	key := &forgev1.ForgejoGPGKey{ObjectMeta: metav1.ObjectMeta{Name: f.key.Name, Namespace: f.key.Namespace, UID: "gpg-owner"}, Spec: forgev1.GPGKeySpec{
+	key := &forgev1.ForgejoGPGKey{ObjectMeta: metav1.ObjectMeta{Name: f.key.Name, Namespace: f.key.Namespace, UID: "gpg-owner", CreationTimestamp: metav1.NewTime(f.now)}, Spec: forgev1.GPGKeySpec{
 		ProviderRef: "shared", ProviderNamespace: "providers", User: "renovate", Identity: forgev1.GPGIdentity{Name: "Renovate", Email: "bot@example.test"}, SecretRef: forgev1.GPGSecretRef{Name: "signing-key"}, DeletionPolicy: forgev1.DeletionPolicyDelete,
 	}}
 	kube := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(key).WithIndex(&forgev1.ForgejoGPGKey{}, gpgSecretIndex, gpgSecretRefs).WithIndex(&forgev1.ForgejoGPGKey{}, gpgProviderIndex, gpgProviderRefs).WithIndex(&forgev1.ForgejoProvider{}, gpgTokenIndex, gpgTokenRefs).WithObjects(key,
@@ -363,8 +363,8 @@ func TestGPGSecretCannotRetireUnmanagedKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := f.reconcile()
-	if meta.IsStatusConditionTrue(key.Status.Conditions, "Ready") || f.deletes != 0 {
-		t.Fatal("Secret annotation authorized deletion of an unmanaged key")
+	if !meta.IsStatusConditionTrue(key.Status.Conditions, "Ready") || f.deletes != 0 {
+		t.Fatal("Secret annotation authorized deletion or wedged reconciliation")
 	}
 }
 
@@ -769,8 +769,8 @@ func TestGPGRefusesUnknownStatusJournalEvenOnDeletion(t *testing.T) {
 				}
 			} else {
 				key = f.reconcile()
-				if meta.IsStatusConditionTrue(key.Status.Conditions, "Ready") || f.deletes != 0 || len(f.keys) != 2 {
-					t.Fatal("unproven status/annotation entry authorized deletion")
+				if !meta.IsStatusConditionTrue(key.Status.Conditions, "Ready") || f.deletes != 0 || len(f.keys) != 2 || slices.Contains(key.Status.ManagedKeyIDs, stranger) {
+					t.Fatal("unproven status/annotation entry wedged reconcile or authorized deletion")
 				}
 			}
 		})
@@ -791,8 +791,8 @@ func TestGPGStatusLossDoesNotTrustAnnotationJournal(t *testing.T) {
 		t.Fatal(err)
 	}
 	key = f.reconcile()
-	if meta.IsStatusConditionTrue(key.Status.Conditions, "Ready") || f.deletes != 0 || len(f.keys) != 2 {
-		t.Fatal("status loss let annotation authorize deletion")
+	if !meta.IsStatusConditionTrue(key.Status.Conditions, "Ready") || f.deletes != 0 || len(f.keys) != 2 || len(key.Status.ManagedKeyIDs) != 1 {
+		t.Fatal("status loss let annotation authorize deletion or wedge recovery")
 	}
 }
 
@@ -819,7 +819,7 @@ func TestGPGRevocationWithOrphanAndTamperedStatus(t *testing.T) {
 type failGPGJournal struct{ client.Client }
 
 func (c *failGPGJournal) Create(ctx context.Context, object client.Object, opts ...client.CreateOption) error {
-	if _, ok := object.(*corev1.ConfigMap); ok {
+	if _, ok := object.(*forgev1.ForgejoGPGKeyState); ok {
 		return errors.New("simulated provenance storage failure")
 	}
 	return c.Client.Create(ctx, object, opts...)

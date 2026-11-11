@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"time"
@@ -54,7 +55,11 @@ func main() {
 		(&controller.ProviderReconciler{Reconciler: base}).SetupWithManager,
 		(&controller.OrganizationReconciler{Reconciler: base}).SetupWithManager,
 		(&controller.RepositoryReconciler{Reconciler: base}).SetupWithManager,
-		(&controller.GPGKeyReconciler{Reconciler: base, StateNamespace: os.Getenv("POD_NAMESPACE")}).SetupWithManager,
+	}
+	if namespace := os.Getenv("POD_NAMESPACE"); namespace != "" {
+		setups = append(setups, (&controller.GPGKeyReconciler{Reconciler: base, StateNamespace: namespace}).SetupWithManager)
+	} else {
+		log.Print("GPG controller disabled: POD_NAMESPACE is empty")
 	}
 	setups = append(setups, controller.ManagedSetups(base)...)
 	for _, setup := range setups {

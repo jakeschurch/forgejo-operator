@@ -66,8 +66,8 @@ type GPGKeyStatus struct {
 	CommonStatus `json:",inline"`
 	KeyID        string `json:"keyID,omitempty"`
 	Fingerprint  string `json:"fingerprint,omitempty"`
-	// ManagedKeyIDs is the durable cleanup journal, written before registration.
-	// It includes staged and retiring keys so deletion also works without a Secret.
+	// ManagedKeyIDs mirrors protected ForgejoGPGKeyState for humans.
+	// Status is never trusted for registration, rotation, retirement or deletion.
 	ManagedKeyIDs []string `json:"managedKeyIDs,omitempty"`
 }
 

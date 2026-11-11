@@ -25,7 +25,7 @@
             pname = "forgejo-operator";
             version = "0.1.0";
             src = mkSrc pkgs.lib;
-            vendorHash = "sha256-UZsq4EMc5bM3b42zRim/7IrM0DwapPblsNA3MpL3lV0=";
+            vendorHash = "sha256-xr0iDFo2mxsZ4KPs/3qV6UP48PCGQ5JgD8uQXOPPSdk=";
             subPackages = [ "cmd/manager" ];
             ldflags = [ "-s" "-w" ];
             env.CGO_ENABLED = "0";

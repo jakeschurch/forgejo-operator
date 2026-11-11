@@ -16,6 +16,77 @@ Credentials are never copied to specs, status, events, or logs.
 The operator watches all namespaces, but all Secret references are resolved in
 the custom resource's namespace.
 
+## User signing keys
+
+2026-11-11: `ForgejoGPGKey` manages an OpenPGP signing key for an existing user.
+It uses the referenced provider's **site administrator API token** with
+`Sudo: <user>` on Forgejo 17's `/user/emails` and `/user/gpg_keys` routes.
+The token needs user/email and GPG-key permissions. `providerNamespace` may
+reference a shared provider; the output Secret always lives beside the CR.
+Creating these CRs permits acting on that provider's users, so restrict CR and
+provider write access accordingly.
+
+```yaml
+apiVersion: forgejo.jakeschurch.com/v1alpha1
+kind: ForgejoGPGKey
+metadata:
+  name: renovate
+  namespace: argo
+spec:
+  providerRef: code-jakeschurch
+  providerNamespace: forgejo
+  user: renovate
+  identity:
+    name: Renovate
+    email: renovate@localhost.invalid
+  algorithm: ed25519
+  secretRef:
+    name: renovate-signing-key
+    keys:
+      privateKey: privateKey
+      publicKey: publicKey
+      keyID: keyID
+      fingerprint: fingerprint
+  rotation:
+    after: 2160h
+    gracePeriod: 24h
+```
+
+The identity email must be an activated address on that account. The operator
+checks it before generation or registration and reports `EmailVerified=False`
+on failure. It never activates or edits account emails. Provider, user, identity,
+algorithm and Secret coordinates are immutable. The default `ed25519` produces
+a v4 EdDSA signing key and cv25519 encryption subkey; `rsa4096` is also supported.
+
+An absent Secret is generated in-process using ProtonMail/go-crypto. The four
+output keys default as shown; the two key exports are ASCII armored. An existing
+unowned Secret can supply a matching, unencrypted private key; public metadata is
+derived from it and the CR takes ownership. Secrets with another owner are refused.
+Only the public key is sent to Forgejo. Missing remote keys are re-registered
+without changing private material. Status adds `keyID`, `fingerprint`,
+`KeyRegistered`, `EmailVerified` and a public key-ID cleanup journal.
+
+Omit `rotation.after` to disable automatic rotation. Both durations must be
+positive; the grace defaults to 24h. A pending private key is persisted under the
+reserved `forgejoPendingPrivateKey` data key before registration; promotion
+atomically replaces the four outputs and stores a retirement deadline in the
+`forgejo.jakeschurch.com/gpg-state` annotation. Restarts replay this transaction.
+Rotation waits for previous retirement before producing another candidate.
+Secret/provider events wake reconciliation; remote drift and time deadlines
+are checked at most every ten minutes (one-minute retry on errors).
+
+Consumers using environment variables need a new pod to read the rotated key.
+Set grace longer than any outstanding signing run or queued head: removing an
+old public key also ends Forgejo verification of its historical signatures.
+Secret loss generates a replacement and retires keys from the durable journal.
+Deletion always removes only this CR's journaled keys and holds its finalizer on
+API failures; Kubernetes garbage collects its owned Secret afterwards.
+`deletionPolicy`, `prune` and `rotationNonce` do not apply to this resource.
+
+API references: [Forgejo 17 Sudo routing](https://codeberg.org/forgejo/forgejo/src/tag/v17.0.1/routers/api/v1/api.go),
+[user GPG operations](https://codeberg.org/forgejo/forgejo/src/tag/v17.0.1/routers/api/v1/user/gpg_key.go),
+and [activated email listing](https://codeberg.org/forgejo/forgejo/src/tag/v17.0.1/routers/api/v1/user/email.go).
+
 ## Repository merge detection
 
 `ForgejoRepository.spec.allowManualMerge` permits Forgejo's native API to record

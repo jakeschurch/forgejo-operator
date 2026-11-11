@@ -496,6 +496,7 @@ type ForgejoLabelList struct {
 
 func init() {
 	SchemeBuilder.Register(
+		&ForgejoGPGKey{}, &ForgejoGPGKeyList{},
 		&ForgejoProvider{}, &ForgejoProviderList{}, &ForgejoOrganization{}, &ForgejoOrganizationList{},
 		&ForgejoTeam{}, &ForgejoTeamList{}, &ForgejoMembership{}, &ForgejoMembershipList{},
 		&ForgejoRobotAccount{}, &ForgejoRobotAccountList{}, &ForgejoAccessToken{}, &ForgejoAccessTokenList{},

@@ -34,7 +34,7 @@ spec:
             - { name: health, containerPort: 8081 }
           lifecycle: {preStop: {sleep: {seconds: 5}}}
           startupProbe:
-            httpGet: {path: /healthz, port: 8081}
+            httpGet: {path: /healthz, port: health}
             periodSeconds: 5
             failureThreshold: 60
           livenessProbe: { httpGet: { path: /healthz, port: health } }

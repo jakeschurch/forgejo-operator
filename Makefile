@@ -11,6 +11,7 @@ verify: generate test
 	go vet ./...
 	helm lint charts/forgejo-operator
 	helm template forgejo-operator charts/forgejo-operator >/dev/null
+	python3 charts/forgejo-operator/rollout_test.py
 
 # Needs FORGEJO_BIN: the forgejo binary to run a throwaway instance from. The locked
 # nixpkgs carries 15.0.5: nix build --inputs-from . nixpkgs#forgejo-lts

@@ -94,18 +94,19 @@
             touch $out
           '';
           chart = pkgs.runCommand "forgejo-operator-chart" {
-            nativeBuildInputs = [ pkgs.kubernetes-helm ];
+            nativeBuildInputs = [ pkgs.kubernetes-helm (pkgs.python3.withPackages (ps: [ ps.pyyaml ])) ];
           } ''
             cp -R ${self}/charts/forgejo-operator chart
             chmod -R u+w chart
             helm lint chart
             helm template forgejo-operator chart >/dev/null
+            python3 chart/rollout_test.py
             touch $out
           '';
         });
       devShells = forAllSystems (system:
         let pkgs = import nixpkgs { inherit system; }; in {
-          default = pkgs.mkShell { packages = [ pkgs.go pkgs.gopls pkgs.kubernetes-helm pkgs.kubebuilder ]; };
+          default = pkgs.mkShell { packages = [ pkgs.go pkgs.gopls pkgs.kubernetes-helm pkgs.kubebuilder pkgs.gnumake (pkgs.python3.withPackages (ps: [ ps.pyyaml ])) ]; };
         });
     };
 }

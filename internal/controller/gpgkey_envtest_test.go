@@ -36,7 +36,7 @@ func TestGPGEnvtest(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	for _, name := range []string{"bots", "providers"} {
+	for _, name := range []string{"bots", "providers", "operator-system"} {
 		if err := kube.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name}}); err != nil {
 			t.Fatal(err)
 		}

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	forgev1 "github.com/jakeschurch/forgejo-operator/api/v1alpha1"
+	"github.com/jakeschurch/forgejo-operator/internal/credentials"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,7 +32,7 @@ func TestIntegrationForgejoGPGKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	r := &GPGKeyReconciler{Reconciler: Reconciler{Client: h.kube, Transport: statusLog{t}}, Now: func() time.Time { return now }}
+	r := &GPGKeyReconciler{StateNamespace: "operator-system", Reconciler: Reconciler{Client: h.kube, Transport: statusLog{t}}, Now: func() time.Time { return now }}
 	key := &forgev1.ForgejoGPGKey{ObjectMeta: metav1.ObjectMeta{Name: "renovate", Namespace: integrationNamespace, UID: "integration-gpg"}, Spec: forgev1.GPGKeySpec{
 		ProviderRef: "default", User: "renovate", Identity: forgev1.GPGIdentity{Name: "Renovate", Email: "renovate@example.invalid"}, SecretRef: forgev1.GPGSecretRef{Name: "signing-key"}, DeletionPolicy: forgev1.DeletionPolicyDelete,
 		Rotation: &forgev1.GPGKeyRotation{After: &metav1.Duration{Duration: time.Hour}, GracePeriod: &metav1.Duration{Duration: 30 * time.Minute}},
@@ -69,6 +70,34 @@ func TestIntegrationForgejoGPGKey(t *testing.T) {
 	if !bytes.Equal(private, secret.Data["privateKey"]) {
 		t.Fatal("idempotent reconcile changed private key")
 	}
+	// A Secret writer cannot replace the private key even with legitimate ownership.
+	attacker, err := credentials.GenerateGPG(key.Spec.Identity.Name, key.Spec.Identity.Email, "ed25519", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret.Data["privateKey"] = attacker.Private
+	if err := h.kube.Update(ctx, &secret); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(key)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.kube.Get(ctx, client.ObjectKeyFromObject(key), key); err != nil {
+		t.Fatal(err)
+	}
+	condition := meta.FindStatusCondition(key.Status.Conditions, "KeyRegistered")
+	if condition == nil || condition.Reason != "SecretTampered" || key.Status.KeyID != first {
+		t.Fatal("replacement private key accepted")
+	}
+	keys, err = listGPG(ctx, api, "renovate")
+	if err != nil || len(keys) != 1 || keys[0].KeyID != first {
+		t.Fatalf("tampering altered registered key: %v", err)
+	}
+	secret.Data["privateKey"] = private
+	if err := h.kube.Update(ctx, &secret); err != nil {
+		t.Fatal(err)
+	}
+	reconcile()
 	// Forgejo must parse this as a signing key whose email belongs to the bot.
 	var registered struct {
 		CanSign bool `json:"can_sign"`
@@ -106,6 +135,37 @@ func TestIntegrationForgejoGPGKey(t *testing.T) {
 	if err != nil || len(keys) != 1 || keys[0].KeyID == first {
 		t.Fatalf("retirement failed: count=%d err=%v", len(keys), err)
 	}
+	// Policy revocation and administrator promotion must each revoke the minted
+	// key, then still permit Delete cleanup without the creation authorization gate.
+	provider.Spec.GPGKeys.AllowedUsers = nil
+	if err := h.kube.Update(ctx, &provider); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(key)}); err != nil {
+		t.Fatal(err)
+	}
+	keys, err = listGPG(ctx, api, "renovate")
+	if err != nil || len(keys) != 0 {
+		t.Fatalf("allowlist revocation kept signing key: %v", err)
+	}
+	provider.Spec.GPGKeys.AllowedUsers = []string{"renovate"}
+	if err := h.kube.Update(ctx, &provider); err != nil {
+		t.Fatal(err)
+	}
+	reconcile()
+	if err := api.Do(ctx, http.MethodPatch, "admin/users/renovate", map[string]any{"admin": true}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(key)}); err != nil {
+		t.Fatal(err)
+	}
+	keys, err = listGPG(ctx, api, "renovate")
+	if err != nil || len(keys) != 0 {
+		t.Fatalf("administrator promotion kept signing key: %v", err)
+	}
+	if err := h.kube.Get(ctx, client.ObjectKeyFromObject(key), key); err != nil {
+		t.Fatal(err)
+	}
 	if err := h.kube.Delete(ctx, key); err != nil {
 		t.Fatal(err)
 	}
@@ -115,5 +175,68 @@ func TestIntegrationForgejoGPGKey(t *testing.T) {
 	keys, err = listGPG(ctx, api, "renovate")
 	if err != nil || len(keys) != 0 {
 		t.Fatalf("deletion failed: count=%d err=%v", len(keys), err)
+	}
+}
+
+// Reproduce the reviewer's Forgejo 17 attack: create a CR before namespace
+// opt-in, then plant an offline key with its publicly readable owner UID.
+func TestIntegrationForgejoGPGForgedOwner(t *testing.T) {
+	f := startForgejo(t)
+	f.createUser(t, "renovate")
+	h := newOperatorHarness(t, f)
+	ctx := context.Background()
+	api := f.client(t, f.providerToken)
+	var provider forgev1.ForgejoProvider
+	if err := h.kube.Get(ctx, client.ObjectKey{Namespace: integrationNamespace, Name: "default"}, &provider); err != nil {
+		t.Fatal(err)
+	}
+	provider.Spec.GPGKeys = &forgev1.GPGKeyPolicy{AllowedUsers: []string{"renovate"}}
+	if err := h.kube.Update(ctx, &provider); err != nil {
+		t.Fatal(err)
+	}
+	key := &forgev1.ForgejoGPGKey{ObjectMeta: metav1.ObjectMeta{Namespace: "argo", Name: "forged", UID: "forged-cr-uid"}, Spec: forgev1.GPGKeySpec{ProviderRef: "default", ProviderNamespace: integrationNamespace, User: "renovate", Identity: forgev1.GPGIdentity{Name: "Renovate", Email: "renovate@example.invalid"}, SecretRef: forgev1.GPGSecretRef{Name: "forged-key"}}}
+	if err := h.kube.Create(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	r := &GPGKeyReconciler{StateNamespace: "operator-system", Reconciler: Reconciler{Client: h.kube, Transport: statusLog{t}}}
+	reconcile := func() {
+		t.Helper()
+		if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(key)}); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.kube.Get(ctx, client.ObjectKeyFromObject(key), key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reconcile() // Initially unauthorized: no Secret or minted fingerprint.
+	attacker, err := credentials.GenerateGPG(key.Spec.Identity.Name, key.Spec.Identity.Email, "ed25519", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "argo", Name: "forged-key"}, Data: map[string][]byte{"privateKey": attacker.Private}}
+	controller := true
+	secret.OwnerReferences = []metav1.OwnerReference{{APIVersion: forgev1.GroupVersion.String(), Kind: "ForgejoGPGKey", Name: key.Name, UID: key.UID, Controller: &controller}}
+	if err := h.kube.Create(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+	provider.Spec.GPGKeys.AllowedNamespaces = []string{"argo"}
+	if err := h.kube.Update(ctx, &provider); err != nil {
+		t.Fatal(err)
+	}
+	reconcile()
+	condition := meta.FindStatusCondition(key.Status.Conditions, "KeyRegistered")
+	if meta.IsStatusConditionTrue(key.Status.Conditions, "Ready") || condition == nil || condition.Reason != "SecretTampered" || key.Status.KeyID != "" {
+		t.Fatal("forged owner adopted attacker key")
+	}
+	keys, err := listGPG(ctx, api, "renovate")
+	if err != nil || len(keys) != 0 {
+		t.Fatalf("planted key registered: %v", err)
+	}
+	if err := h.kube.Delete(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+	reconcile()
+	if !meta.IsStatusConditionTrue(key.Status.Conditions, "Ready") || key.Status.KeyID == attacker.KeyID {
+		t.Fatal("deleting planted Secret did not mint a new key")
 	}
 }

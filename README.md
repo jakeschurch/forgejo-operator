@@ -6,8 +6,8 @@ protections.
 
 The API is `forgejo.jakeschurch.com/v1alpha1`. Resources are namespaced,
 credentials are read only from same-namespace Secrets, and deletion defaults to
-`Orphan`, except operator-owned `ForgejoGPGKey` signing keys, which always clean
-up their remote keys and owned Secret. See [docs/api-contract.md](docs/api-contract.md).
+`Orphan`. `ForgejoGPGKey` also defaults to `Orphan`; opt into `Delete` to remove
+its managed remote public keys on deletion. See [docs/api-contract.md](docs/api-contract.md).
 
 ## Development
 

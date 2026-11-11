@@ -19,6 +19,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -34,6 +35,10 @@ type GPGKeyReconciler struct {
 	Reconciler
 	// Now is a test seam for rotation and grace deadlines.
 	Now func() time.Time
+	// StateNamespace is the operator namespace, never a tenant-controlled namespace.
+	StateNamespace string
+	StateReader    client.Reader
+	Recorder       record.EventRecorder
 }
 
 type gpgRetiring struct {
@@ -53,7 +58,44 @@ type remoteGPGKey struct {
 	KeyID string `json:"key_id"`
 }
 
+const gpgSecretIndex = "gpg.secret"
+const gpgProviderIndex = "gpg.provider"
+const gpgTokenIndex = "gpg.token"
+
+func gpgSecretRefs(object client.Object) []string {
+	key := object.(*forgev1.ForgejoGPGKey)
+	return []string{key.Namespace + "/" + key.Spec.SecretRef.Name}
+}
+
+func gpgProviderRefs(object client.Object) []string {
+	key := object.(*forgev1.ForgejoGPGKey)
+	return []string{gpgProviderNS(key) + "/" + key.Spec.ProviderRef}
+}
+
+func gpgTokenRefs(object client.Object) []string {
+	provider := object.(*forgev1.ForgejoProvider)
+	return []string{provider.Namespace + "/" + provider.Spec.TokenSecretRef.Name}
+}
+
 func (r *GPGKeyReconciler) SetupWithManager(m ctrl.Manager) error {
+	if r.StateNamespace == "" {
+		return errors.New("operator namespace is required for GPG provenance")
+	}
+	r.StateReader = m.GetAPIReader()
+	r.Recorder = m.GetEventRecorderFor("forgejo-gpgkey")
+	for _, index := range []struct {
+		object  client.Object
+		field   string
+		extract client.IndexerFunc
+	}{
+		{&forgev1.ForgejoGPGKey{}, gpgSecretIndex, gpgSecretRefs},
+		{&forgev1.ForgejoGPGKey{}, gpgProviderIndex, gpgProviderRefs},
+		{&forgev1.ForgejoProvider{}, gpgTokenIndex, gpgTokenRefs},
+	} {
+		if err := m.GetFieldIndexer().IndexField(context.Background(), index.object, index.field, index.extract); err != nil {
+			return err
+		}
+	}
 	return ctrl.NewControllerManagedBy(m).
 		For(&forgev1.ForgejoGPGKey{}, builder.WithPredicates(primaryResourceChanges())).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.secretRequests)).
@@ -62,38 +104,38 @@ func (r *GPGKeyReconciler) SetupWithManager(m ctrl.Manager) error {
 
 func (r *GPGKeyReconciler) secretRequests(ctx context.Context, object client.Object) []ctrl.Request {
 	var keys forgev1.ForgejoGPGKeyList
-	if err := r.List(ctx, &keys); err != nil {
+	ref := object.GetNamespace() + "/" + object.GetName()
+	if err := r.List(ctx, &keys, client.MatchingFields{gpgSecretIndex: ref}); err != nil {
 		return nil
+	}
+	requests := map[client.ObjectKey]bool{}
+	for i := range keys.Items {
+		requests[client.ObjectKeyFromObject(&keys.Items[i])] = true
 	}
 	var providers forgev1.ForgejoProviderList
-	if err := r.List(ctx, &providers, client.InNamespace(object.GetNamespace())); err != nil {
+	if err := r.List(ctx, &providers, client.MatchingFields{gpgTokenIndex: ref}); err != nil {
 		return nil
 	}
-	var requests []ctrl.Request
-	for _, key := range keys.Items {
-		matches := key.Namespace == object.GetNamespace() && key.Spec.SecretRef.Name == object.GetName()
-		for _, provider := range providers.Items {
-			if gpgProviderNS(&key) == provider.Namespace && key.Spec.ProviderRef == provider.Name && provider.Spec.TokenSecretRef.Name == object.GetName() {
-				matches = true
-			}
-		}
-		if matches {
-			requests = append(requests, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(&key)})
+	for i := range providers.Items {
+		for _, req := range r.providerRequests(ctx, &providers.Items[i]) {
+			requests[req.NamespacedName] = true
 		}
 	}
-	return requests
+	var result []ctrl.Request
+	for key := range requests {
+		result = append(result, ctrl.Request{NamespacedName: key})
+	}
+	return result
 }
 
 func (r *GPGKeyReconciler) providerRequests(ctx context.Context, object client.Object) []ctrl.Request {
 	var keys forgev1.ForgejoGPGKeyList
-	if err := r.List(ctx, &keys); err != nil {
+	if err := r.List(ctx, &keys, client.MatchingFields{gpgProviderIndex: object.GetNamespace() + "/" + object.GetName()}); err != nil {
 		return nil
 	}
 	var requests []ctrl.Request
-	for _, key := range keys.Items {
-		if gpgProviderNS(&key) == object.GetNamespace() && key.Spec.ProviderRef == object.GetName() {
-			requests = append(requests, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(&key)})
-		}
+	for i := range keys.Items {
+		requests = append(requests, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(&keys.Items[i])})
 	}
 	return requests
 }
@@ -136,18 +178,43 @@ func (r *GPGKeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 	gpgCondition(&key, "EmailVerified", metav1.ConditionUnknown, "NotChecked", "activated account email has not been checked")
 	gpgCondition(&key, "KeyRegistered", metav1.ConditionUnknown, "NotChecked", "key registration has not been checked")
-	api, err := r.authorizedGPGClient(ctx, &key)
-	if err == nil && !key.DeletionTimestamp.IsZero() {
-		if !contains(key.Finalizers, finalizer) {
-			return ctrl.Result{}, nil
+	var err error
+	if !key.DeletionTimestamp.IsZero() {
+		// 2026-11-11: never-authorized resources must not need provider access to delete.
+		var ids []string
+		ids, err = r.provenGPGIDs(ctx, &key)
+		if err == nil && len(ids) > 0 {
+			var api *forgeapi.Client
+			api, err = r.providerClient(ctx, gpgProviderNS(&key), key.Spec.ProviderRef)
+			if err == nil {
+				err = r.removeGPG(ctx, api, &key, ids)
+			}
 		}
-		err = r.deleteGPGKeys(ctx, api, &key)
 		if err == nil {
 			key.Finalizers = remove(key.Finalizers, finalizer)
 			return ctrl.Result{}, r.Update(ctx, &key)
 		}
-	} else if err == nil {
-		err = r.reconcileGPG(ctx, api, &key)
+	} else {
+		var api *forgeapi.Client
+		api, err = r.authorizedGPGClient(ctx, &key)
+		if errors.Is(err, errGPGUnauthorized) {
+			// Revocation can only delete proven minted keys; it cannot mint or register.
+			ids, cleanupErr := r.provenGPGIDs(ctx, &key)
+			if cleanupErr == nil && len(ids) > 0 {
+				var cleanup *forgeapi.Client
+				cleanup, cleanupErr = r.providerClient(ctx, gpgProviderNS(&key), key.Spec.ProviderRef)
+				if cleanupErr == nil {
+					cleanupErr = r.removeGPG(ctx, cleanup, &key, ids)
+				}
+			}
+			if cleanupErr != nil {
+				err = fmt.Errorf("authorization revoked; key revocation failed: %w", cleanupErr)
+			} else {
+				gpgCondition(&key, "KeyRegistered", metav1.ConditionFalse, "AuthorizationRevoked", "management authorization revoked; operator-minted public keys removed")
+			}
+		} else if err == nil {
+			err = r.reconcileGPG(ctx, api, &key)
+		}
 	}
 	setStatus(&key.Status.CommonStatus, key.Generation, err)
 	if updateErr := r.Status().Update(ctx, &key); updateErr != nil {
@@ -166,7 +233,9 @@ func (r *GPGKeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	return ctrl.Result{RequeueAfter: max(time.Second, delay)}, nil
 }
 
-// 2026-11-11: authorization precedes all Sudo, email and key operations.
+var errGPGUnauthorized = errors.New("GPG management is not authorized")
+
+// 2026-11-11: authorization precedes email reads, minting and registration.
 func (r *GPGKeyReconciler) authorizedGPGClient(ctx context.Context, key *forgev1.ForgejoGPGKey) (*forgeapi.Client, error) {
 	var provider forgev1.ForgejoProvider
 	if err := r.Get(ctx, client.ObjectKey{Namespace: gpgProviderNS(key), Name: key.Spec.ProviderRef}, &provider); err != nil {
@@ -174,10 +243,10 @@ func (r *GPGKeyReconciler) authorizedGPGClient(ctx context.Context, key *forgev1
 	}
 	policy := provider.Spec.GPGKeys
 	if policy == nil || !slices.Contains(policy.AllowedUsers, key.Spec.User) {
-		return nil, errors.New("provider gpgKeys.allowedUsers does not authorize the target user")
+		return nil, fmt.Errorf("%w: provider gpgKeys.allowedUsers does not authorize the target user", errGPGUnauthorized)
 	}
 	if key.Namespace != provider.Namespace && !slices.Contains(policy.AllowedNamespaces, key.Namespace) {
-		return nil, errors.New("provider gpgKeys.allowedNamespaces does not authorize this namespace")
+		return nil, fmt.Errorf("%w: provider gpgKeys.allowedNamespaces does not authorize this namespace", errGPGUnauthorized)
 	}
 	api, err := r.providerClient(ctx, provider.Namespace, provider.Name)
 	if err != nil {
@@ -190,7 +259,7 @@ func (r *GPGKeyReconciler) authorizedGPGClient(ctx context.Context, key *forgev1
 		return nil, err
 	}
 	if user.IsAdmin == nil || *user.IsAdmin {
-		return nil, errors.New("GPG key management refuses site administrators or unknown administrator status")
+		return nil, fmt.Errorf("%w: GPG key management refuses site administrators or unknown administrator status", errGPGUnauthorized)
 	}
 	return api, nil
 }
@@ -260,10 +329,24 @@ func (r *GPGKeyReconciler) reconcileGPG(ctx context.Context, api *forgeapi.Clien
 	if err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
+	secretMissing := apierrors.IsNotFound(err)
+	journal, err := r.readGPGJournal(ctx, key)
+	if err != nil {
+		return err
+	}
+	if !secretMissing && len(journal.Minted) == 0 {
+		return r.gpgTampered(key)
+	}
+	if err := journal.validateIDs(key.Status.ManagedKeyIDs); err != nil {
+		return err
+	}
 	state := gpgState{}
-	if apierrors.IsNotFound(err) {
+	if secretMissing {
 		material, err := credentials.GenerateGPG(key.Spec.Identity.Name, key.Spec.Identity.Email, key.Spec.Algorithm, r.now())
 		if err != nil {
+			return err
+		}
+		if err := r.mintGPGJournal(ctx, key, journal, material); err != nil {
 			return err
 		}
 		secret = corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: key.Spec.SecretRef.Name, Namespace: key.Namespace}, Type: corev1.SecretTypeOpaque, Data: map[string][]byte{}}
@@ -286,6 +369,9 @@ func (r *GPGKeyReconciler) reconcileGPG(ctx context.Context, api *forgeapi.Clien
 			return err
 		}
 	} else {
+		if journal.CurrentID == "" && journal.PendingID == "" {
+			return r.gpgTampered(key)
+		}
 		if !metav1.IsControlledBy(&secret, key) {
 			return errors.New("referenced Secret is not controlled by this ForgejoGPGKey; refusing adoption")
 		}
@@ -300,13 +386,20 @@ func (r *GPGKeyReconciler) reconcileGPG(ctx context.Context, api *forgeapi.Clien
 	}
 	material, err := credentials.ReadGPG(secret.Data[outputs[0]], key.Spec.Identity.Name, key.Spec.Identity.Email, key.Spec.Algorithm)
 	if err != nil {
-		return err
+		return r.gpgTampered(key)
 	}
+	if !journal.accepts(material) {
+		return r.gpgTampered(key)
+	}
+
 	pendingID := ""
 	if len(secret.Data[gpgPendingPrivate]) != 0 {
 		pending, err := credentials.ReadGPG(secret.Data[gpgPendingPrivate], key.Spec.Identity.Name, key.Spec.Identity.Email, key.Spec.Algorithm)
 		if err != nil {
-			return err
+			return r.gpgTampered(key)
+		}
+		if pending.KeyID != journal.PendingID || !journal.accepts(pending) {
+			return r.gpgTampered(key)
 		}
 		pendingID = pending.KeyID
 		if pendingID == material.KeyID {
@@ -314,25 +407,12 @@ func (r *GPGKeyReconciler) reconcileGPG(ctx context.Context, api *forgeapi.Clien
 		}
 	}
 	stateChanged := false
-	// A restored owned Secret can recover a lost status journal, but only for
-	// retirement entries that still exist on this user's remote account.
-	if len(key.Status.ManagedKeyIDs) == 0 && len(state.Retiring) > 0 {
-		remote, err := listGPG(ctx, api, key.Spec.User)
-		if err != nil {
-			return err
+	// 2026-11-11: neither Secret annotations nor remote existence prove minting.
+	if len(key.Status.ManagedKeyIDs) == 0 {
+		for id := range journal.Minted {
+			key.Status.ManagedKeyIDs = append(key.Status.ManagedKeyIDs, id)
 		}
-		retiring := make([]gpgRetiring, 0, len(state.Retiring))
-		for _, old := range state.Retiring {
-			if old.KeyID == material.KeyID || old.KeyID == pendingID {
-				return errors.New("Secret retirement state must reference only previous keys")
-			}
-			if slices.ContainsFunc(remote, func(k remoteGPGKey) bool { return strings.EqualFold(k.KeyID, old.KeyID) }) {
-				key.Status.ManagedKeyIDs = append(key.Status.ManagedKeyIDs, old.KeyID)
-				retiring = append(retiring, old)
-			}
-		}
-		state.Retiring = retiring
-		stateChanged = true
+		slices.Sort(key.Status.ManagedKeyIDs)
 	}
 	for _, old := range state.Retiring {
 		if old.KeyID == material.KeyID || old.KeyID == pendingID || !slices.Contains(key.Status.ManagedKeyIDs, old.KeyID) {
@@ -386,6 +466,9 @@ func (r *GPGKeyReconciler) reconcileGPG(ctx context.Context, api *forgeapi.Clien
 		if err != nil {
 			return err
 		}
+		if err := r.mintGPGJournal(ctx, key, journal, pending); err != nil {
+			return err
+		}
 		secret.Data[gpgPendingPrivate] = pending.Private
 		if err := r.Update(ctx, &secret); err != nil {
 			return err
@@ -394,7 +477,7 @@ func (r *GPGKeyReconciler) reconcileGPG(ctx context.Context, api *forgeapi.Clien
 	if len(secret.Data[gpgPendingPrivate]) != 0 {
 		pending, err := credentials.ReadGPG(secret.Data[gpgPendingPrivate], key.Spec.Identity.Name, key.Spec.Identity.Email, key.Spec.Algorithm)
 		if err != nil {
-			return err
+			return r.gpgTampered(key)
 		}
 		if pending.KeyID == material.KeyID {
 			return errors.New("staged key must differ from the current signing key")
@@ -412,6 +495,12 @@ func (r *GPGKeyReconciler) reconcileGPG(ctx context.Context, api *forgeapi.Clien
 			return err
 		}
 		key.Status.KeyID, key.Status.Fingerprint, key.Status.RemoteID = pending.KeyID, pending.Fingerprint, strconv.FormatInt(remote, 10)
+	}
+	if journal.CurrentID != key.Status.KeyID || journal.PendingID != "" {
+		journal.CurrentID, journal.PendingID = key.Status.KeyID, ""
+		if err := r.writeGPGJournal(ctx, key, journal); err != nil {
+			return err
+		}
 	}
 	// Successful promotion/retirement makes the Secret's transaction record the
 	// complete set. This also repairs a status update lost after retirement.
@@ -469,6 +558,13 @@ func listGPG(ctx context.Context, api *forgeapi.Client, user string) ([]remoteGP
 }
 
 func (r *GPGKeyReconciler) registerGPG(ctx context.Context, api *forgeapi.Client, key *forgev1.ForgejoGPGKey, material *credentials.GPGKey) (int64, error) {
+	journal, err := r.readGPGJournal(ctx, key)
+	if err != nil {
+		return 0, err
+	}
+	if !journal.accepts(material) {
+		return 0, r.gpgTampered(key)
+	}
 	if !slices.Contains(key.Status.ManagedKeyIDs, material.KeyID) {
 		key.Status.ManagedKeyIDs = append(key.Status.ManagedKeyIDs, material.KeyID)
 		if err := r.Status().Update(ctx, key); err != nil {
@@ -496,6 +592,13 @@ func (r *GPGKeyReconciler) registerGPG(ctx context.Context, api *forgeapi.Client
 }
 
 func (r *GPGKeyReconciler) removeGPG(ctx context.Context, api *forgeapi.Client, key *forgev1.ForgejoGPGKey, ids []string) error {
+	journal, err := r.readGPGJournal(ctx, key)
+	if err != nil {
+		return err
+	}
+	if err := journal.validateIDs(ids); err != nil {
+		return err
+	}
 	keys, err := listGPG(ctx, api, key.Spec.User)
 	if isNotFound(err) {
 		return nil
@@ -514,6 +617,17 @@ func (r *GPGKeyReconciler) removeGPG(ctx context.Context, api *forgeapi.Client, 
 	return nil
 }
 
-func (r *GPGKeyReconciler) deleteGPGKeys(ctx context.Context, api *forgeapi.Client, key *forgev1.ForgejoGPGKey) error {
-	return r.removeGPG(ctx, api, key, key.Status.ManagedKeyIDs)
+// The protected journal remains authoritative when tenant-writable status is lost.
+func (r *GPGKeyReconciler) provenGPGIDs(ctx context.Context, key *forgev1.ForgejoGPGKey) ([]string, error) {
+	journal, err := r.readGPGJournal(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	// Tenant status cannot expand the delete set or block revocation of proven keys.
+	ids := make([]string, 0, len(journal.Minted))
+	for id := range journal.Minted {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return ids, nil
 }

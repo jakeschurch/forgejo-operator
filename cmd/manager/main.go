@@ -54,7 +54,7 @@ func main() {
 		(&controller.ProviderReconciler{Reconciler: base}).SetupWithManager,
 		(&controller.OrganizationReconciler{Reconciler: base}).SetupWithManager,
 		(&controller.RepositoryReconciler{Reconciler: base}).SetupWithManager,
-		(&controller.GPGKeyReconciler{Reconciler: base}).SetupWithManager,
+		(&controller.GPGKeyReconciler{Reconciler: base, StateNamespace: os.Getenv("POD_NAMESPACE")}).SetupWithManager,
 	}
 	setups = append(setups, controller.ManagedSetups(base)...)
 	for _, setup := range setups {

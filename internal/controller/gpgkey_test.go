@@ -22,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -48,11 +49,11 @@ func newGPGFixture(t *testing.T) *gpgFixture {
 	key := &forgev1.ForgejoGPGKey{ObjectMeta: metav1.ObjectMeta{Name: f.key.Name, Namespace: f.key.Namespace, UID: "gpg-owner"}, Spec: forgev1.GPGKeySpec{
 		ProviderRef: "shared", ProviderNamespace: "providers", User: "renovate", Identity: forgev1.GPGIdentity{Name: "Renovate", Email: "bot@example.test"}, SecretRef: forgev1.GPGSecretRef{Name: "signing-key"}, DeletionPolicy: forgev1.DeletionPolicyDelete,
 	}}
-	kube := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(key).WithObjects(key,
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(key).WithIndex(&forgev1.ForgejoGPGKey{}, gpgSecretIndex, gpgSecretRefs).WithIndex(&forgev1.ForgejoGPGKey{}, gpgProviderIndex, gpgProviderRefs).WithIndex(&forgev1.ForgejoProvider{}, gpgTokenIndex, gpgTokenRefs).WithObjects(key,
 		&forgev1.ForgejoProvider{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "providers"}, Spec: forgev1.ForgejoProviderSpec{GPGKeys: &forgev1.GPGKeyPolicy{AllowedUsers: []string{"renovate"}, AllowedNamespaces: []string{"bots"}}, URL: "https://forgejo.invalid", TokenSecretRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "admin"}, Key: "token"}}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "admin", Namespace: "providers"}, Data: map[string][]byte{"token": []byte("admin-sensitive")}},
 	).Build()
-	f.r = &GPGKeyReconciler{Reconciler: Reconciler{Client: kube, Transport: roundTripFunc(f.serve)}, Now: func() time.Time { return f.now }}
+	f.r = &GPGKeyReconciler{StateNamespace: "operator-system", Reconciler: Reconciler{Client: kube, Transport: roundTripFunc(f.serve)}, Now: func() time.Time { return f.now }}
 	return f
 }
 
@@ -280,7 +281,7 @@ func TestGPGRotationRecoversAfterRegistrationBeforePromotion(t *testing.T) {
 		t.Fatal("failed promotion changed mounted key or lost staged key")
 	}
 	// New controller instance: no in-memory rotation state survives.
-	f.r = &GPGKeyReconciler{Reconciler: f.r.Reconciler, Now: func() time.Time { return f.now }}
+	f.r = &GPGKeyReconciler{StateNamespace: "operator-system", Reconciler: f.r.Reconciler, Now: func() time.Time { return f.now }}
 	f.reconcile()
 	if f.posts != 2 || string(f.secret().Data["keyID"]) == old {
 		t.Fatal("restarted rotation duplicated registration or failed promotion")
@@ -523,7 +524,7 @@ func TestGPGRestoresLostStatusDuringGrace(t *testing.T) {
 	secret := f.secret()
 	var state gpgState
 	_ = json.Unmarshal([]byte(secret.Annotations[gpgStateAnnotation]), &state)
-	state.Retiring = append(state.Retiring, gpgRetiring{KeyID: "ABSENT", RemoveAfter: f.now})
+	// Valid retirement entries can be recovered only with operator provenance.
 	writeGPGState(secret, state)
 	if err := f.r.Update(context.Background(), secret); err != nil {
 		t.Fatal(err)
@@ -582,5 +583,256 @@ func TestGPGSecretLossDoesNotPublishUnregisteredKey(t *testing.T) {
 	var secret corev1.Secret
 	if err := f.r.Get(context.Background(), client.ObjectKey{Namespace: "bots", Name: "signing-key"}, &secret); !apierrors.IsNotFound(err) {
 		t.Fatal("Secret-loss recovery published unregistered credentials")
+	}
+}
+
+// 2026-11-11: Kubernetes allows Secret creators to forge controller owner UIDs.
+func TestGPGRefusesForgedOwnerAndStatus(t *testing.T) {
+	for _, spoofStatus := range []bool{false, true} {
+		t.Run(fmt.Sprint(spoofStatus), func(t *testing.T) {
+			f := newGPGFixture(t)
+			ctx := context.Background()
+			var key forgev1.ForgejoGPGKey
+			if err := f.r.Get(ctx, f.key, &key); err != nil {
+				t.Fatal(err)
+			}
+			attacker, err := credentials.GenerateGPG(key.Spec.Identity.Name, key.Spec.Identity.Email, "ed25519", f.now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "signing-key", Namespace: "bots"}, Data: map[string][]byte{}}
+			if err := ctrl.SetControllerReference(&key, secret, f.r.Scheme()); err != nil {
+				t.Fatal(err)
+			}
+			writeGPGOutputs(secret, [4]string{"privateKey", "publicKey", "keyID", "fingerprint"}, attacker)
+			writeGPGState(secret, gpgState{CreatedAt: f.now})
+			if err := f.r.Create(ctx, secret); err != nil {
+				t.Fatal(err)
+			}
+			if spoofStatus {
+				key.Status.KeyID, key.Status.Fingerprint = attacker.KeyID, attacker.Fingerprint
+				key.Status.ManagedKeyIDs = []string{attacker.KeyID}
+				if err := f.r.Status().Update(ctx, &key); err != nil {
+					t.Fatal(err)
+				}
+			}
+			recorder := record.NewFakeRecorder(5)
+			f.r.Recorder = recorder
+			key = *f.reconcile()
+			if meta.IsStatusConditionTrue(key.Status.Conditions, "Ready") || f.posts != 0 || f.deletes != 0 {
+				t.Fatal("forged owner/status authorized a key")
+			}
+			if c := meta.FindStatusCondition(key.Status.Conditions, "KeyRegistered"); c == nil || c.Reason != "SecretTampered" {
+				t.Fatal("missing tamper condition")
+			}
+			select {
+			case event := <-recorder.Events:
+				if !strings.Contains(event, "SecretTampered") || strings.Contains(event, attacker.Fingerprint) || strings.Contains(event, "BEGIN") {
+					t.Fatal("unsafe or missing tamper event")
+				}
+			default:
+				t.Fatal("missing tamper event")
+			}
+		})
+	}
+}
+
+func TestGPGRefusesPrivateAndPendingKeySwap(t *testing.T) {
+	for _, field := range []string{"privateKey", gpgPendingPrivate} {
+		t.Run(field, func(t *testing.T) {
+			f := newGPGFixture(t)
+			original := f.reconcile()
+			attacker, err := credentials.GenerateGPG("Renovate", "bot@example.test", "ed25519", f.now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			secret := f.secret()
+			secret.Data[field] = attacker.Private
+			if err := f.r.Update(context.Background(), secret); err != nil {
+				t.Fatal(err)
+			}
+			f.now = f.now.Add(48 * time.Hour)
+			key := f.reconcile()
+			condition := meta.FindStatusCondition(key.Status.Conditions, "KeyRegistered")
+			if meta.IsStatusConditionTrue(key.Status.Conditions, "Ready") || condition == nil || condition.Reason != "SecretTampered" || f.posts != 1 || f.deletes != 0 || key.Status.KeyID != original.Status.KeyID || len(f.keys) != 1 {
+				t.Fatal("Secret swap registered/retired a key or lost tamper condition")
+			}
+			if err := f.r.Delete(context.Background(), f.secret()); err != nil {
+				t.Fatal(err)
+			}
+			key = f.reconcile()
+			if !meta.IsStatusConditionTrue(key.Status.Conditions, "Ready") || key.Status.KeyID == original.Status.KeyID || key.Status.KeyID == attacker.KeyID || f.posts != 2 {
+				t.Fatal("Secret deletion did not recover with a fresh minted key")
+			}
+		})
+	}
+}
+
+func TestGPGDeauthorizationRevokesAndAllowsDeletion(t *testing.T) {
+	for _, admin := range []bool{false, true} {
+		for _, deleting := range []bool{false, true} {
+			t.Run(fmt.Sprintf("admin=%t/deleting=%t", admin, deleting), func(t *testing.T) {
+				f := newGPGFixture(t)
+				ctx := context.Background()
+				key := f.reconcile()
+				// Unrelated keys on the same account must survive revocation.
+				f.keys = append(f.keys, remoteGPGKey{ID: 999, KeyID: "DEADBEEF01234567"})
+				if admin {
+					f.admin = true
+				} else {
+					var provider forgev1.ForgejoProvider
+					if err := f.r.Get(ctx, client.ObjectKey{Namespace: "providers", Name: "shared"}, &provider); err != nil {
+						t.Fatal(err)
+					}
+					provider.Spec.GPGKeys.AllowedUsers = nil
+					if err := f.r.Update(ctx, &provider); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if deleting {
+					if err := f.r.Delete(ctx, key); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := f.r.Reconcile(ctx, ctrl.Request{NamespacedName: f.key}); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					key = f.reconcile()
+					if meta.IsStatusConditionTrue(key.Status.Conditions, "Ready") {
+						t.Fatal("deauthorized key ready")
+					}
+					if err := f.r.Delete(ctx, key); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := f.r.Reconcile(ctx, ctrl.Request{NamespacedName: f.key}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if f.posts != 1 || f.deletes != 1 || len(f.keys) != 1 || f.keys[0].ID != 999 {
+					t.Fatal("revocation did not remove only the minted key")
+				}
+				if err := f.r.Get(ctx, f.key, &forgev1.ForgejoGPGKey{}); !apierrors.IsNotFound(err) {
+					t.Fatalf("deauthorization stuck finalizer: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestGPGNeverAuthorizedDeleteNeedsNoProvider(t *testing.T) {
+	f := newGPGFixture(t)
+	ctx := context.Background()
+	if err := f.r.Delete(ctx, &forgev1.ForgejoProvider{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "providers"}}); err != nil {
+		t.Fatal(err)
+	}
+	key := f.reconcile()
+	if err := f.r.Delete(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.r.Reconcile(ctx, ctrl.Request{NamespacedName: f.key}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.r.Get(ctx, f.key, &forgev1.ForgejoGPGKey{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("empty cleanup journal stuck finalizer: %v", err)
+	}
+}
+
+func TestGPGRefusesUnknownStatusJournalEvenOnDeletion(t *testing.T) {
+	for _, deleting := range []bool{false, true} {
+		t.Run(fmt.Sprint(deleting), func(t *testing.T) {
+			f := newGPGFixture(t)
+			ctx := context.Background()
+			key := f.reconcile()
+			const stranger = "DEADBEEF01234567"
+			f.keys = append(f.keys, remoteGPGKey{ID: 999, KeyID: stranger})
+			key.Status.ManagedKeyIDs = append(key.Status.ManagedKeyIDs, stranger)
+			if err := f.r.Status().Update(ctx, key); err != nil {
+				t.Fatal(err)
+			}
+			secret := f.secret()
+			var state gpgState
+			_ = json.Unmarshal([]byte(secret.Annotations[gpgStateAnnotation]), &state)
+			state.Retiring = append(state.Retiring, gpgRetiring{KeyID: stranger, RemoveAfter: f.now})
+			writeGPGState(secret, state)
+			if err := f.r.Update(ctx, secret); err != nil {
+				t.Fatal(err)
+			}
+			if deleting {
+				if err := f.r.Delete(ctx, key); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := f.r.Reconcile(ctx, ctrl.Request{NamespacedName: f.key}); err != nil {
+					t.Fatal(err)
+				}
+				if f.deletes != 1 || len(f.keys) != 1 || f.keys[0].ID != 999 {
+					t.Fatal("deletion trusted an unknown journal ID or failed to revoke the proven key")
+				}
+			} else {
+				key = f.reconcile()
+				if meta.IsStatusConditionTrue(key.Status.Conditions, "Ready") || f.deletes != 0 || len(f.keys) != 2 {
+					t.Fatal("unproven status/annotation entry authorized deletion")
+				}
+			}
+		})
+	}
+}
+
+func TestGPGStatusLossDoesNotTrustAnnotationJournal(t *testing.T) {
+	f := newGPGFixture(t)
+	key := f.reconcile()
+	f.keys = append(f.keys, remoteGPGKey{ID: 999, KeyID: "DEADBEEF01234567"})
+	secret := f.secret()
+	writeGPGState(secret, gpgState{CreatedAt: f.now, Retiring: []gpgRetiring{{KeyID: "DEADBEEF01234567", RemoveAfter: f.now}}})
+	if err := f.r.Update(context.Background(), secret); err != nil {
+		t.Fatal(err)
+	}
+	key.Status = forgev1.GPGKeyStatus{}
+	if err := f.r.Status().Update(context.Background(), key); err != nil {
+		t.Fatal(err)
+	}
+	key = f.reconcile()
+	if meta.IsStatusConditionTrue(key.Status.Conditions, "Ready") || f.deletes != 0 || len(f.keys) != 2 {
+		t.Fatal("status loss let annotation authorize deletion")
+	}
+}
+
+func TestGPGRevocationWithOrphanAndTamperedStatus(t *testing.T) {
+	f := newGPGFixture(t)
+	ctx := context.Background()
+	key := f.reconcile()
+	key.Spec.DeletionPolicy = forgev1.DeletionPolicyOrphan
+	if err := f.r.Update(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	key.Status = forgev1.GPGKeyStatus{ManagedKeyIDs: []string{"DEADBEEF01234567"}}
+	f.keys = append(f.keys, remoteGPGKey{ID: 999, KeyID: "DEADBEEF01234567"})
+	if err := f.r.Status().Update(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	f.admin = true
+	key = f.reconcile()
+	if len(f.keys) != 1 || f.keys[0].ID != 999 || f.deletes != 1 || meta.IsStatusConditionTrue(key.Status.Conditions, "Ready") {
+		t.Fatal("Orphan/tampered status prevented authorization revocation or removed an unknown key")
+	}
+}
+
+type failGPGJournal struct{ client.Client }
+
+func (c *failGPGJournal) Create(ctx context.Context, object client.Object, opts ...client.CreateOption) error {
+	if _, ok := object.(*corev1.ConfigMap); ok {
+		return errors.New("simulated provenance storage failure")
+	}
+	return c.Client.Create(ctx, object, opts...)
+}
+func TestGPGProvenanceMustPersistBeforePublication(t *testing.T) {
+	f := newGPGFixture(t)
+	f.r.Client = &failGPGJournal{Client: f.r.Client}
+	key := f.reconcile()
+	if f.posts != 0 || meta.IsStatusConditionTrue(key.Status.Conditions, "Ready") {
+		t.Fatal("registered key before minting provenance persisted")
+	}
+	var secret corev1.Secret
+	if err := f.r.Get(context.Background(), client.ObjectKey{Namespace: "bots", Name: "signing-key"}, &secret); !apierrors.IsNotFound(err) {
+		t.Fatal("published private key without provenance")
 	}
 }

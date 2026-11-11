@@ -66,8 +66,14 @@ a v4 EdDSA signing key and cv25519 encryption subkey; `rsa4096` is also supporte
 An absent Secret is generated in-process using ProtonMail/go-crypto, and the
 public key is registered before the consumer Secret is created (also after
 Secret loss). The four output keys default as shown; the exports are ASCII
-armored. Existing Secrets must already be controlled by this CR; unowned or
-foreign Secrets are refused rather than adopted.
+armored. Existing Secrets must already be controlled by this CR and match the active or
+staged fingerprint recorded when the operator generated the key. Owner references
+alone never prove ownership: they can be forged by any Secret creator. An empty
+minting journal with an existing Secret is refused, even with a matching owner.
+A replaced private key raises `KeyRegistered=False`, reason `SecretTampered`, and
+a warning event without key material. The registered key is retained. Recovery:
+delete the tampered Secret; the operator generates and registers a fresh key and
+retires the previous proven key after grace.
 Only the public key is sent to Forgejo. Missing remote keys are re-registered
 without changing private material. Deleting a key in the Forgejo UI is therefore
 not revocation: delete its Kubernetes Secret to generate a replacement, or delete
@@ -89,11 +95,26 @@ Consumers using environment variables need a new pod to read the rotated key.
 Set grace longer than any outstanding signing run or queued head: removing an
 old public key also ends Forgejo verification of its historical signatures.
 Secret loss generates a replacement and retires keys from the durable journal.
-If status is lost during grace, the journal is rebuilt from the owned Secret's
-retirement annotation intersected with keys still present on the target account.
+Public minting fingerprints and active/staged IDs are persisted before any
+registration in `forgejo-gpg-<sha256(CR UID)>` ConfigMaps in the operator's own
+namespace (`POD_NAMESPACE`, injected by the chart). These records contain no
+private keys. Keep this namespace restricted to operator administrators; tenant
+Secret and CR status permissions must not grant access to these ConfigMaps.
+Records are retained for audit/recovery after CR deletion. Back them up with the
+operator namespace: losing a record fails closed for existing Secrets and
+unproven cleanup IDs, rather than adopting them. Pre-provenance Secrets are also
+refused; recreate the CR and its Secret to mint a new key, and clean up old
+unproven remote keys manually. If status is lost during grace, recovery accepts only retirement
+entries with matching operator minting provenance. Status or annotation entries
+for unknown IDs can never authorize deletion.
 `deletionPolicy` defaults to `Orphan`: no finalizer, remote public keys retained,
 and Kubernetes garbage collects the owned Secret. `Delete` removes only this
-CR's journaled keys and holds its finalizer on API failures. Switch to `Orphan`
+CR's proven journaled keys and holds its finalizer on API failures. Removing a
+user/namespace from the provider allowlist, disabling GPG management, or promoting
+the target to administrator revokes its journaled keys even with `Orphan` policy.
+Revocation and `Delete` cleanup bypass creation authorization and never touch
+unproven keys. A never-authorized CR with an empty journal can delete without a
+provider. Switch to `Orphan`
 to release deletion without a provider. `prune` and `rotationNonce` do not apply.
 
 API references: [Forgejo 17 Sudo routing](https://codeberg.org/forgejo/forgejo/src/tag/v17.0.1/routers/api/v1/api.go),

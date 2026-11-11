@@ -102,42 +102,68 @@ Secret loss generates a replacement and retires keys from the durable journal.
 2026-11-11: public minting fingerprints, current/pending IDs, rotation clock,
 retirement deadlines and the deauthorization debounce are persisted in the
 cluster-scoped `ForgejoGPGKeyState` CRD (`forgejo.jakeschurch.com/v1alpha1`), named
-`forgejo-gpg-<sha256(CR UID)>`. An empty record is reserved on the CR's first
-reconcile, before authorization or any remote request. The old ConfigMap journal
-is unused and has no migration path: this feature is unreleased. State contains
-no private material and is read directly from the API, with resource-version
-conflicts preventing stale updates.
+`forgejo-gpg-<sha256(CR UID)>`. An empty record is reserved only after provider
+policy authorizes the namespace and user and the account is confirmed non-admin.
+The old ConfigMap journal is unused and has no migration path: this feature is
+unreleased. State contains no private material and is read directly from the API,
+with resource-version conflicts preventing stale updates.
 
-**The operator ServiceAccount must be the only non-administrator principal with
-create/update/patch/delete access to `forgejogpgkeystates`.** Do not grant these
-verbs to tenants, reflectors, workload controllers, broad API-group writers or
-aggregated admin/edit/view roles. The chart binds a dedicated, unaggregated
-ClusterRole only to the operator ServiceAccount. Ordinary namespace permissions
-on Secrets and ConfigMaps cannot write this cluster-scoped resource. Kubernetes
-cluster administrators remain trusted and can change RBAC. Audit pre-existing
-cluster-wide wildcard grants before deployment.
+**Write access to `forgejogpgkeystates` is administrator-equivalent for this
+feature.** A writer can forge minting provenance; source annotations do not
+identify the writer. RBAC on this CRD is the trust root. Treat write access to
+Argo CD Applications/AppProjects, kro ResourceGraphDefinitions (RGDs), and
+MutatingWebhookConfigurations as administrator-equivalent too: these can direct
+privileged controllers or mutate the operator's state writes. Do not grant these
+paths to untrusted tenants, reflectors or workload controllers. The chart binds
+a dedicated, unaggregated state ClusterRole only to the operator ServiceAccount;
+namespace Secret/ConfigMap permissions alone cannot write state. This binding
+does not restrict pre-existing wildcard grants or privileged deputies.
+
+The homelab RBAC audit on 2026-11-11 identified these trusted paths:
+
+- Direct state writers: cluster administrators (including `system:masters` and
+  `helm-cilium`), `argocd-application-controller`, kro, `argocd-server` (patch),
+  the storage-version migrator and generic garbage collector.
+- Argo CD deputies: Application patchers `nix-build-workflow`,
+  `argocd-tag-updater` and `argocd-notifications-controller`, and pushers to
+  `foundry-labs/foundrybox:main` through `external-repo-roots`. The `cluster-apps`
+  and `default` AppProjects allow `sourceRepos: ['*']` and all cluster resources.
+  These deputy paths are inferred from permissions, not exercised against live
+  resources. Follow-up `margo-0u0.117` scopes patchers to named Applications and
+  restricts repository sources; it is linked to `margo-0u0.96`.
+- MutatingWebhookConfiguration writers: `cert-manager-cainjector`, cnpg, kyverno,
+  vpa and `argocd-server` (patch).
+
+These principals are already administrator-equivalent in this deployment,
+including paths to the provider administrator token. Audit these direct and
+indirect grants when deploying; the chart does not narrow them.
 
 Kubernetes disallows a namespaced owner for a cluster-scoped resource. State
-therefore binds the source CR's UID, namespace and name plus the operator
-namespace through checked annotations. Reads refuse any owner reference,
-mismatched binding, deletion in progress, or state predating the CR. These checks
-are defense in depth; annotations do not identify a writer. RBAC is the trust
-root. `POD_NAMESPACE` identifies the operator deployment and is injected by the
-chart. If it is empty, only the GPG controller is disabled with a log message;
-other controllers still start.
+therefore binds the source CR's UID, namespace and name through checked
+annotations. Reads refuse any owner reference, mismatched binding, deletion in
+progress, or state more than five seconds older than the CR. The clock tolerance
+allows small apiserver skew. State is independent of the operator namespace, so
+moving the deployment preserves provenance. These checks are defense in depth;
+RBAC remains authoritative. `POD_NAMESPACE` identifies the deployment and is
+injected by the chart. If it is empty, only the GPG controller is disabled with a
+log message; other controllers still start.
 
-Records are retained after CR deletion for audit. Back them up with cluster
-resources. Losing a record fails closed for an existing Secret, rather than
-adopting it. Delete the Secret to mint a replacement, and clean up any unproven
-remote keys manually. Status wipes recover from protected current/pending and
+Both deletion policies use a finalizer to delete cluster-scoped state before
+releasing the CR. Back up state with cluster resources while the CR exists.
+Losing a record fails closed for an existing Secret, rather than adopting it.
+Delete the Secret to mint a replacement, and clean up any unproven remote keys
+manually. Status wipes recover from protected current/pending and
 not-yet-removed IDs, never from tenant annotations or historical removed keys.
 Unknown mirror IDs produce a warning and are filtered without blocking normal
-reconciliation. Confirmed remote retirement prunes fingerprints; at most eight
-live fingerprints are retained, bounding repeated publication failures. Minting
-waits at the cap until protected retirement deadlines permit cleanup.
-`deletionPolicy` defaults to `Orphan`: no finalizer, remote public keys retained,
-and Kubernetes garbage collects the owned Secret. `Delete` removes only this
-CR's proven journaled keys and holds its finalizer on API failures. Removing a
+reconciliation. Confirmed remote retirement prunes fingerprints; minting is
+capped at eight non-retiring fingerprints. Secret-loss recovery can retain more than eight
+retiring fingerprints until grace ends without blocking signing. Lost pending
+material is removed remotely before another mint, so repeated publication
+failures do not accumulate fingerprints.
+`deletionPolicy` defaults to `Orphan`: remote public keys are retained and
+Kubernetes garbage collects the owned Secret. Its finalizer only deletes local
+state and requires no provider access. `Delete` removes only this CR's proven
+journaled keys and holds its finalizer on API failures. Removing a
 user/namespace from the provider allowlist, disabling GPG management, or promoting
 the target to administrator revokes its journaled keys even with `Orphan` policy.
 Policy removal must persist across two consecutive unauthorized observations at
@@ -146,9 +172,10 @@ observation resets the persisted debounce; retries occur after one minute.
 Confirmed administrator promotion revokes immediately. A transient policy blip
 therefore pauses management without immediately losing signature verification.
 Revocation and `Delete` cleanup bypass creation authorization and never touch
-unproven keys. A never-authorized CR with an empty journal can delete without a
-provider. Switch to `Orphan`
-to release deletion without a provider. `prune` and `rotationNonce` do not apply.
+unproven keys. A missing or refused journal proves no IDs: revocation is a safe
+no-op, and deletion removes state and releases the finalizer without a provider. Switch to
+`Orphan` to release deletion without a provider when proven remote keys remain.
+`prune` and `rotationNonce` do not apply.
 
 API references: [Forgejo 17 Sudo routing](https://codeberg.org/forgejo/forgejo/src/tag/v17.0.1/routers/api/v1/api.go),
 [user GPG operations](https://codeberg.org/forgejo/forgejo/src/tag/v17.0.1/routers/api/v1/user/gpg_key.go),

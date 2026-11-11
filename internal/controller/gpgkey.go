@@ -35,7 +35,7 @@ type GPGKeyReconciler struct {
 	Reconciler
 	// Now is a test seam for rotation and grace deadlines.
 	Now func() time.Time
-	// StateNamespace is the operator namespace, never a tenant-controlled namespace.
+	// StateNamespace identifies the deployment, not a binding on cluster-scoped state.
 	StateNamespace string
 	StateReader    client.Reader
 	Recorder       record.EventRecorder
@@ -160,25 +160,9 @@ func (r *GPGKeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if err := r.Get(ctx, req.NamespacedName, &key); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	// Reserve protected state before any finalizer, authorization or Secret work.
-	if _, err := r.readGPGJournal(ctx, &key); err != nil {
-		setStatus(&key.Status.CommonStatus, key.Generation, err)
-		if updateErr := r.Status().Update(ctx, &key); updateErr != nil {
-			return ctrl.Result{}, updateErr
-		}
-		return ctrl.Result{RequeueAfter: time.Minute}, nil
-	}
-	// 2026-11-11: Orphan must remain deletable without a working provider.
-	if key.Spec.DeletionPolicy != forgev1.DeletionPolicyDelete && contains(key.Finalizers, finalizer) {
-		key.Finalizers = remove(key.Finalizers, finalizer)
-		if err := r.Update(ctx, &key); err != nil {
-			return ctrl.Result{}, err
-		}
-	}
-	if !key.DeletionTimestamp.IsZero() && !contains(key.Finalizers, finalizer) {
-		return ctrl.Result{}, nil
-	}
-	if key.DeletionTimestamp.IsZero() && key.Spec.DeletionPolicy == forgev1.DeletionPolicyDelete && !contains(key.Finalizers, finalizer) {
+	// 2026-11-11: both policies need local state cleanup; Orphan never needs
+	// provider access to finish deletion.
+	if key.DeletionTimestamp.IsZero() && !contains(key.Finalizers, finalizer) {
 		key.Finalizers = append(key.Finalizers, finalizer)
 		if err := r.Update(ctx, &key); err != nil {
 			return ctrl.Result{}, err
@@ -188,27 +172,24 @@ func (r *GPGKeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	gpgCondition(&key, "KeyRegistered", metav1.ConditionUnknown, "NotChecked", "key registration has not been checked")
 	var err error
 	if !key.DeletionTimestamp.IsZero() {
-		// 2026-11-11: never-authorized resources must not need provider access to delete.
-		var ids []string
-		ids, err = r.provenGPGIDs(ctx, &key)
-		if err == nil && len(ids) > 0 {
-			var api *forgeapi.Client
-			api, err = r.providerClient(ctx, gpgProviderNS(&key), key.Spec.ProviderRef)
-			if err == nil {
-				err = r.removeGPG(ctx, api, &key, ids)
+		if key.Spec.DeletionPolicy == forgev1.DeletionPolicyDelete {
+			var ids []string
+			ids, err = r.provenGPGIDs(ctx, &key)
+			if err == nil && len(ids) > 0 {
+				var api *forgeapi.Client
+				api, err = r.providerClient(ctx, gpgProviderNS(&key), key.Spec.ProviderRef)
 				if err == nil {
-					var journal *gpgJournal
-					journal, err = r.readGPGJournal(ctx, &key)
-					if err == nil {
-						journal.Minted = map[string]string{}
-						journal.CurrentID, journal.PendingID = "", ""
-						journal.Retiring = nil
-						err = r.writeGPGJournal(ctx, &key, journal)
-					}
+					err = r.removeGPG(ctx, api, &key, ids)
 				}
 			}
 		}
 		if err == nil {
+			err = r.deleteGPGJournal(ctx, &key)
+		}
+		if err == nil {
+			if !contains(key.Finalizers, finalizer) {
+				return ctrl.Result{}, nil
+			}
 			key.Finalizers = remove(key.Finalizers, finalizer)
 			return ctrl.Result{}, r.Update(ctx, &key)
 		}
@@ -216,11 +197,13 @@ func (r *GPGKeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		var api *forgeapi.Client
 		api, err = r.authorizedGPGClient(ctx, &key)
 		if errors.Is(err, errGPGUnauthorized) {
-			journal, cleanupErr := r.readGPGJournal(ctx, &key)
+			journal, cleanupErr := r.cleanupGPGJournal(ctx, &key)
 			if cleanupErr == nil {
 				r.warnGPGMirrors(&key, &corev1.Secret{}, journal)
 				key.Status.ManagedKeyIDs = journal.ids()
-				if journal.UnauthorizedSince == nil {
+				if journal.record == nil {
+					// No proven keys or state to debounce: revocation is a safe no-op.
+				} else if journal.UnauthorizedSince == nil {
 					observed := r.now()
 					// metav1.Time persists whole seconds. Round upward so
 					// serialization can never shorten the 60-second debounce.
@@ -246,7 +229,13 @@ func (r *GPGKeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			}
 		} else {
 			// Authorized or indeterminate observations break the consecutive sequence.
-			journal, stateErr := r.readGPGJournal(ctx, &key)
+			var journal *gpgJournal
+			var stateErr error
+			if err == nil {
+				journal, stateErr = r.ensureGPGJournal(ctx, &key)
+			} else {
+				journal, stateErr = r.cleanupGPGJournal(ctx, &key)
+			}
 			if stateErr == nil && journal.UnauthorizedSince != nil {
 				journal.UnauthorizedSince = nil
 				stateErr = r.writeGPGJournal(ctx, &key, journal)
@@ -292,7 +281,7 @@ func (r *GPGKeyReconciler) authorizedGPGClient(ctx context.Context, key *forgev1
 		policyErr = fmt.Errorf("%w: provider gpgKeys.allowedNamespaces does not authorize this namespace", errGPGUnauthorized)
 	}
 	if policyErr != nil {
-		journal, err := r.readGPGJournal(ctx, key)
+		journal, err := r.cleanupGPGJournal(ctx, key)
 		if err != nil {
 			return nil, err
 		}
@@ -400,6 +389,16 @@ func (r *GPGKeyReconciler) reconcileGPG(ctx context.Context, api *forgeapi.Clien
 	r.warnGPGMirrors(key, &secret, journal)
 	state := journal.lifecycle()
 	if secretMissing {
+		// 2026-11-11: private material for a pending mint was never published or
+		// has been lost. Confirm removal before forgetting it and retrying.
+		if id := journal.PendingID; id != "" {
+			if err := r.removeGPG(ctx, api, key, []string{id}); err != nil {
+				return err
+			}
+			delete(journal.Minted, id)
+			journal.PendingID = ""
+			state.Retiring = slices.DeleteFunc(state.Retiring, func(old gpgRetiring) bool { return old.KeyID == id })
+		}
 		// Persist cleanup of every not-yet-removed key, independently of status.
 		for id := range journal.Minted {
 			if !slices.ContainsFunc(state.Retiring, func(old gpgRetiring) bool { return old.KeyID == id }) {
@@ -414,7 +413,7 @@ func (r *GPGKeyReconciler) reconcileGPG(ctx context.Context, api *forgeapi.Clien
 			return err
 		}
 		state = journal.lifecycle()
-		if len(journal.Minted) >= maxGPGMinted {
+		if journal.activeMinted() >= maxGPGMinted {
 			return errors.New("GPG minting limit reached; waiting for retirement")
 		}
 		material, err := credentials.GenerateGPG(key.Spec.Identity.Name, key.Spec.Identity.Email, key.Spec.Algorithm, r.now())
@@ -501,7 +500,7 @@ func (r *GPGKeyReconciler) reconcileGPG(ctx context.Context, api *forgeapi.Clien
 	state = journal.lifecycle()
 	due := key.Spec.Rotation != nil && key.Spec.Rotation.After != nil && !r.now().Before(state.CreatedAt.Add(key.Spec.Rotation.After.Duration))
 	if due && len(state.Retiring) == 0 && len(secret.Data[gpgPendingPrivate]) == 0 {
-		if len(journal.Minted) >= maxGPGMinted {
+		if journal.activeMinted() >= maxGPGMinted {
 			return errors.New("GPG minting limit reached; waiting for retirement")
 		}
 		pending, err := credentials.GenerateGPG(key.Spec.Identity.Name, key.Spec.Identity.Email, key.Spec.Algorithm, r.now())
@@ -665,7 +664,7 @@ func (r *GPGKeyReconciler) removeGPG(ctx context.Context, api *forgeapi.Client, 
 
 // The protected journal remains authoritative when tenant-writable status is lost.
 func (r *GPGKeyReconciler) provenGPGIDs(ctx context.Context, key *forgev1.ForgejoGPGKey) ([]string, error) {
-	journal, err := r.readGPGJournal(ctx, key)
+	journal, err := r.cleanupGPGJournal(ctx, key)
 	if err != nil {
 		return nil, err
 	}

@@ -11,6 +11,7 @@ import (
 	forgev1 "github.com/jakeschurch/forgejo-operator/api/v1alpha1"
 	"github.com/jakeschurch/forgejo-operator/internal/credentials"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -370,4 +371,134 @@ func TestIntegrationForgejoGPGProtectedLifecycle(t *testing.T) {
 			t.Fatal("protected retirement failed")
 		}
 	}
+}
+
+// 2026-11-11: final review regressions run against a disposable Forgejo 17.
+func TestIntegrationForgejoGPGRecoveryAndRefusedCleanup(t *testing.T) {
+	f := startForgejo(t)
+	f.createUser(t, "renovate")
+	h := newOperatorHarness(t, f)
+	ctx := context.Background()
+	api := f.client(t, f.providerToken)
+	var provider forgev1.ForgejoProvider
+	if err := h.kube.Get(ctx, client.ObjectKey{Namespace: integrationNamespace, Name: "default"}, &provider); err != nil {
+		t.Fatal(err)
+	}
+	provider.Spec.GPGKeys = &forgev1.GPGKeyPolicy{AllowedUsers: []string{"renovate"}}
+	if err := h.kube.Update(ctx, &provider); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	r := &GPGKeyReconciler{StateNamespace: "operator-system", Reconciler: Reconciler{Client: h.kube, Transport: statusLog{t}}, Now: func() time.Time { return now }}
+	key := &forgev1.ForgejoGPGKey{ObjectMeta: metav1.ObjectMeta{Name: "recovery", Namespace: integrationNamespace, UID: "recovery-regressions", CreationTimestamp: metav1.NewTime(now)}, Spec: forgev1.GPGKeySpec{ProviderRef: "default", User: "renovate", Identity: forgev1.GPGIdentity{Name: "Renovate", Email: "renovate@example.invalid"}, SecretRef: forgev1.GPGSecretRef{Name: "recovery"}, DeletionPolicy: forgev1.DeletionPolicyDelete}}
+	if err := h.kube.Create(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(key)}
+	reconcile := func(ready bool) {
+		t.Helper()
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.kube.Get(ctx, req.NamespacedName, key); err != nil {
+			t.Fatal(err)
+		}
+		if ready && !meta.IsStatusConditionTrue(key.Status.Conditions, "Ready") {
+			t.Fatalf("not ready: %+v", key.Status.Conditions)
+		}
+	}
+	checkRemote := func(count int) {
+		t.Helper()
+		keys, err := listGPG(ctx, api, "renovate")
+		if err != nil || len(keys) != count {
+			t.Fatalf("remote count=%d, want %d: %v", len(keys), count, err)
+		}
+	}
+	reconcile(true)
+	journal, err := r.readGPGJournal(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal.record.Annotations["forgejo.jakeschurch.com/gpg-state-operator"] = r.StateNamespace
+	journal.record.CreationTimestamp = metav1.NewTime(key.CreationTimestamp.Add(-time.Second))
+	if err := h.kube.Update(ctx, journal.record); err != nil {
+		t.Fatal(err)
+	}
+	r.StateNamespace = "moved-operator"
+	reconcile(true)
+	checkRemote(1)
+	// Published old keys retain full grace even after more than eight recoveries.
+	for i := 0; i < maxGPGMinted+1; i++ {
+		if err := h.kube.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: key.Spec.SecretRef.Name, Namespace: key.Namespace}}); err != nil {
+			t.Fatal(err)
+		}
+		reconcile(true)
+		checkRemote(i + 2)
+		var remote struct {
+			CanSign bool `json:"can_sign"`
+		}
+		if err := api.DoSudo(ctx, http.MethodGet, "user/gpg_keys/"+key.Status.RemoteID, "renovate", nil, &remote); err != nil || !remote.CanSign {
+			t.Fatalf("recovery %d cannot sign: %v", i+1, err)
+		}
+	}
+	now = now.Add(gpgGrace)
+	reconcile(true)
+	checkRemote(1)
+	// Namespace moves must also preserve proven administrator revocation.
+	if err := api.Do(ctx, http.MethodPatch, "admin/users/renovate", map[string]any{"admin": true}, nil); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(false)
+	checkRemote(0)
+	if err := api.Do(ctx, http.MethodPatch, "admin/users/renovate", map[string]any{"admin": false}, nil); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(true)
+	checkRemote(1)
+	journal, err = r.readGPGJournal(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal.record.Annotations[gpgSourceUID] = "foreign"
+	if err := h.kube.Update(ctx, journal.record); err != nil {
+		t.Fatal(err)
+	}
+	provider.Spec.GPGKeys = nil
+	if err := h.kube.Update(ctx, &provider); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		reconcile(false)
+		condition := meta.FindStatusCondition(key.Status.Conditions, "KeyRegistered")
+		if condition == nil || condition.Reason != "AuthorizationRevoked" {
+			t.Fatalf("refused state blocked deauthorization: %+v", key.Status.Conditions)
+		}
+		now = now.Add(time.Minute)
+	}
+	checkRemote(1) // Refused provenance proves no IDs to revoke.
+	provider.Spec.GPGKeys = &forgev1.GPGKeyPolicy{AllowedUsers: []string{"renovate"}}
+	if err := h.kube.Update(ctx, &provider); err != nil {
+		t.Fatal(err)
+	}
+	if err := api.Do(ctx, http.MethodPatch, "admin/users/renovate", map[string]any{"admin": true}, nil); err != nil {
+		t.Fatal(err)
+	}
+	reconcile(false)
+	condition := meta.FindStatusCondition(key.Status.Conditions, "KeyRegistered")
+	if condition == nil || condition.Reason != "AuthorizationRevoked" {
+		t.Fatal("refused state blocked admin cleanup")
+	}
+	if err := h.kube.Delete(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.kube.Get(ctx, req.NamespacedName, &forgev1.ForgejoGPGKey{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("refused state stuck deletion: %v", err)
+	}
+	if err := h.kube.Get(ctx, client.ObjectKeyFromObject(journal.record), &forgev1.ForgejoGPGKeyState{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("state retained after deletion: %v", err)
+	}
+	checkRemote(1)
 }

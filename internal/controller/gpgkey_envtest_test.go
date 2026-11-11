@@ -20,6 +20,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 )
@@ -98,7 +99,7 @@ func TestGPGEnvtest(t *testing.T) {
 		t.Fatal(err)
 	}
 	stateRef, _ := f.r.journalKey(&source)
-	forgedState := &forgev1.ForgejoGPGKeyState{ObjectMeta: metav1.ObjectMeta{Name: stateRef.Name, Annotations: map[string]string{gpgSourceUID: string(source.UID), gpgSourceName: source.Name, gpgSourceNamespace: source.Namespace, gpgStateOperator: f.r.StateNamespace}}, Spec: forgev1.GPGKeyStateSpec{Minted: map[string]string{"ATTACKER": "FORGED"}, CurrentID: "ATTACKER"}}
+	forgedState := &forgev1.ForgejoGPGKeyState{ObjectMeta: metav1.ObjectMeta{Name: stateRef.Name, Annotations: map[string]string{gpgSourceUID: string(source.UID), gpgSourceName: source.Name, gpgSourceNamespace: source.Namespace}}, Spec: forgev1.GPGKeyStateSpec{Minted: map[string]string{"ATTACKER": "FORGED"}, CurrentID: "ATTACKER"}}
 	if err := tenant.Create(ctx, forgedState); !apierrors.IsForbidden(err) {
 		t.Fatalf("tenant could pre-create trust root: %v", err)
 	}
@@ -140,6 +141,21 @@ func TestGPGEnvtest(t *testing.T) {
 	f.now = f.now.Add(2 * time.Hour)
 	if f.reconcile().Status.KeyID == first {
 		t.Fatal("rotation failed against real Kubernetes")
+	}
+	if err := kube.Get(ctx, f.key, &source); err != nil {
+		t.Fatal(err)
+	}
+	if err := kube.Delete(ctx, &source); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.r.Reconcile(ctx, ctrl.Request{NamespacedName: f.key}); err != nil {
+		t.Fatal(err)
+	}
+	if err := kube.Get(ctx, stateRef, &forgev1.ForgejoGPGKeyState{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("operator failed to delete state under chart RBAC: %v", err)
+	}
+	if err := kube.Get(ctx, f.key, &forgev1.ForgejoGPGKey{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("state cleanup finalizer retained: %v", err)
 	}
 }
 

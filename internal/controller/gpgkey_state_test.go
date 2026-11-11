@@ -11,9 +11,11 @@ import (
 	forgev1 "github.com/jakeschurch/forgejo-operator/api/v1alpha1"
 	"github.com/jakeschurch/forgejo-operator/internal/credentials"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -30,21 +32,144 @@ func (f *gpgFixture) journal() *gpgJournal {
 	return journal
 }
 
-func TestGPGStateReservedBeforeAuthorization(t *testing.T) {
+func TestGPGUnauthorizedNamespaceCreatesNoState(t *testing.T) {
 	f := newGPGFixture(t)
-	f.r.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		var states forgev1.ForgejoGPGKeyStateList
-		if err := f.r.List(req.Context(), &states); err != nil || len(states.Items) != 1 || len(states.Items[0].Spec.Minted) != 0 {
-			t.Fatal("remote access preceded empty state reservation")
-		}
-		// Stop after the authorization lookup so this assertion only sees empty state.
-		return response(200, `{"is_admin":true}`), nil
+	ctx := context.Background()
+	var provider forgev1.ForgejoProvider
+	if err := f.r.Get(ctx, client.ObjectKey{Namespace: "providers", Name: "shared"}, &provider); err != nil {
+		t.Fatal(err)
+	}
+	provider.Spec.GPGKeys.AllowedNamespaces = nil
+	if err := f.r.Update(ctx, &provider); err != nil {
+		t.Fatal(err)
+	}
+	f.r.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		t.Fatal("unauthorized namespace reached Forgejo")
+		return nil, nil
 	})
 	f.reconcile()
+	var states forgev1.ForgejoGPGKeyStateList
+	if err := f.r.List(ctx, &states); err != nil || len(states.Items) != 0 {
+		t.Fatal("unauthorized namespace created state")
+	}
+}
+
+func TestGPGStateNamespaceMoveAndClockSkew(t *testing.T) {
+	for _, skew := range []time.Duration{0, -time.Second, -5 * time.Second} {
+		t.Run(skew.String(), func(t *testing.T) {
+			f := newGPGFixture(t)
+			key := f.reconcile()
+			journal := f.journal()
+			// Old records may still carry the previous operator namespace annotation.
+			journal.record.Annotations["forgejo.jakeschurch.com/gpg-state-operator"] = f.r.StateNamespace
+			journal.record.CreationTimestamp = metav1.NewTime(key.CreationTimestamp.Add(skew))
+			if err := f.r.Update(context.Background(), journal.record); err != nil {
+				t.Fatal(err)
+			}
+			f.r.StateNamespace = "moved-operator"
+			got := f.reconcile()
+			if !meta.IsStatusConditionTrue(got.Status.Conditions, "Ready") || got.Status.KeyID != key.Status.KeyID || f.posts != 1 {
+				t.Fatal("namespace move or clock skew refused valid state")
+			}
+			f.admin = true
+			f.reconcile()
+			if f.deletes != 1 {
+				t.Fatal("namespace move blocked administrator revocation")
+			}
+		})
+	}
+}
+
+func TestGPGCleanupWithRefusedOrMissingState(t *testing.T) {
+	for _, mode := range []string{"refused", "missing"} {
+		for _, action := range []string{"delete", "deauthorize", "admin"} {
+			t.Run(mode+"/"+action, func(t *testing.T) {
+				f := newGPGFixture(t)
+				ctx := context.Background()
+				key := f.reconcile()
+				journal := f.journal()
+				if mode == "refused" {
+					journal.record.Annotations[gpgSourceUID] = "foreign"
+					if err := f.r.Update(ctx, journal.record); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := f.r.Delete(ctx, journal.record); err != nil {
+					t.Fatal(err)
+				}
+				if action == "delete" {
+					if err := f.r.Delete(ctx, key); err != nil {
+						t.Fatal(err)
+					}
+					// Empty/refused provenance must not need a provider for deletion.
+					if err := f.r.Delete(ctx, &forgev1.ForgejoProvider{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "providers"}}); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := f.r.Reconcile(ctx, ctrl.Request{NamespacedName: f.key}); err != nil {
+						t.Fatal(err)
+					}
+					if err := f.r.Get(ctx, f.key, &forgev1.ForgejoGPGKey{}); !apierrors.IsNotFound(err) {
+						t.Fatalf("deletion stuck: %v", err)
+					}
+					if err := f.r.Get(ctx, client.ObjectKeyFromObject(journal.record), &forgev1.ForgejoGPGKeyState{}); !apierrors.IsNotFound(err) {
+						t.Fatalf("state retained after deletion: %v", err)
+					}
+				} else {
+					if action == "admin" {
+						f.admin = true
+					} else {
+						var provider forgev1.ForgejoProvider
+						if err := f.r.Get(ctx, client.ObjectKey{Namespace: "providers", Name: "shared"}, &provider); err != nil {
+							t.Fatal(err)
+						}
+						provider.Spec.GPGKeys = nil
+						if err := f.r.Update(ctx, &provider); err != nil {
+							t.Fatal(err)
+						}
+					}
+					got := f.reconcile()
+					f.now = f.now.Add(time.Minute)
+					got = f.reconcile()
+					condition := meta.FindStatusCondition(got.Status.Conditions, "KeyRegistered")
+					if condition == nil || condition.Reason != "AuthorizationRevoked" {
+						t.Fatalf("cleanup skipped: %+v", got.Status.Conditions)
+					}
+					var states forgev1.ForgejoGPGKeyStateList
+					if err := f.r.List(ctx, &states); err != nil {
+						t.Fatal(err)
+					}
+					if mode == "missing" && len(states.Items) != 0 {
+						t.Fatal("cleanup created state")
+					}
+				}
+				if f.deletes != 0 || len(f.keys) != 1 || f.posts != 1 {
+					t.Fatal("cleanup acted on unproven keys")
+				}
+			})
+		}
+	}
+}
+
+func TestGPGSecretDeletionLoopKeepsSigning(t *testing.T) {
+	f := newGPGFixture(t)
+	f.reconcile()
+	for i := 0; i < maxGPGMinted+1; i++ {
+		if err := f.r.Delete(context.Background(), f.secret()); err != nil {
+			t.Fatal(err)
+		}
+		key := f.reconcile()
+		if !meta.IsStatusConditionTrue(key.Status.Conditions, "Ready") || len(f.keys) != i+2 {
+			t.Fatalf("recovery %d blocked signing or shortened grace: %+v", i+1, key.Status.Conditions)
+		}
+	}
+	f.now = f.now.Add(gpgGrace)
+	f.reconcile()
+	if len(f.keys) != 1 || len(f.journal().Minted) != 1 {
+		t.Fatal("recovery keys failed to retire")
+	}
 }
 
 func TestGPGRefusesForeignAndPredatingState(t *testing.T) {
-	for _, mode := range []string{"foreign_uid", "foreign_name", "foreign_namespace", "foreign_operator", "predates", "owner_reference"} {
+	for _, mode := range []string{"foreign_uid", "foreign_name", "foreign_namespace", "predates", "owner_reference"} {
 		t.Run(mode, func(t *testing.T) {
 			f := newGPGFixture(t)
 			var key forgev1.ForgejoGPGKey
@@ -53,7 +178,7 @@ func TestGPGRefusesForeignAndPredatingState(t *testing.T) {
 				t.Fatal(err)
 			}
 			ref, _ := f.r.journalKey(&key)
-			state := &forgev1.ForgejoGPGKeyState{ObjectMeta: metav1.ObjectMeta{Name: ref.Name, CreationTimestamp: metav1.NewTime(f.now), Annotations: map[string]string{gpgSourceUID: string(key.UID), gpgSourceName: key.Name, gpgSourceNamespace: key.Namespace, gpgStateOperator: f.r.StateNamespace}}, Spec: forgev1.GPGKeyStateSpec{Minted: map[string]string{"ATTACKER": "FORGED"}, CurrentID: "ATTACKER"}}
+			state := &forgev1.ForgejoGPGKeyState{ObjectMeta: metav1.ObjectMeta{Name: ref.Name, CreationTimestamp: metav1.NewTime(f.now), Annotations: map[string]string{gpgSourceUID: string(key.UID), gpgSourceName: key.Name, gpgSourceNamespace: key.Namespace}}, Spec: forgev1.GPGKeyStateSpec{Minted: map[string]string{"ATTACKER": "FORGED"}, CurrentID: "ATTACKER"}}
 			switch mode {
 			case "foreign_uid":
 				state.Annotations[gpgSourceUID] = "other"
@@ -61,19 +186,23 @@ func TestGPGRefusesForeignAndPredatingState(t *testing.T) {
 				state.Annotations[gpgSourceName] = "other"
 			case "foreign_namespace":
 				state.Annotations[gpgSourceNamespace] = "other"
-			case "foreign_operator":
-				delete(state.Annotations, gpgStateOperator)
 			case "predates":
-				state.CreationTimestamp = metav1.NewTime(f.now.Add(-time.Second))
+				state.CreationTimestamp = metav1.NewTime(f.now.Add(-6 * time.Second))
 			case "owner_reference":
 				state.OwnerReferences = []metav1.OwnerReference{{UID: key.UID}}
 			}
 			if err := f.r.Create(ctx, state); err != nil {
 				t.Fatal(err)
 			}
-			f.r.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) { t.Fatal("foreign state reached Forgejo"); return nil, nil })
+			f.r.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Path == "/api/v1/users/renovate" {
+					return response(200, `{"is_admin":false}`), nil
+				}
+				t.Fatal("foreign state reached Forgejo key/email APIs")
+				return nil, nil
+			})
 			got := f.reconcile()
-			if meta.IsStatusConditionTrue(got.Status.Conditions, "Ready") || len(got.Finalizers) != 0 {
+			if meta.IsStatusConditionTrue(got.Status.Conditions, "Ready") {
 				t.Fatal("foreign state accepted")
 			}
 		})
@@ -279,20 +408,49 @@ func TestGPGDeauthorizationDebounce(t *testing.T) {
 	}
 }
 
+func TestGPGMissingSecretConfirmsPendingRemovalBeforeRemint(t *testing.T) {
+	f := newGPGFixture(t)
+	ctx := context.Background()
+	key := f.reconcile()
+	journal := f.journal()
+	pending, err := credentials.GenerateGPG(key.Spec.Identity.Name, key.Spec.Identity.Email, "ed25519", f.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.r.mintGPGJournal(ctx, key, journal, pending); err != nil {
+		t.Fatal(err)
+	}
+	// Registration succeeded, but Secret staging/publication was lost.
+	f.keys = append(f.keys, remoteGPGKey{ID: 99, KeyID: pending.KeyID})
+	if err := f.r.Delete(ctx, f.secret()); err != nil {
+		t.Fatal(err)
+	}
+	f.failDelete = true
+	got := f.reconcile()
+	if meta.IsStatusConditionTrue(got.Status.Conditions, "Ready") || f.posts != 1 || f.journal().PendingID != pending.KeyID {
+		t.Fatal("reminted or forgot pending provenance before confirmed removal")
+	}
+	f.failDelete = false
+	got = f.reconcile()
+	if !meta.IsStatusConditionTrue(got.Status.Conditions, "Ready") || f.posts != 2 || f.deletes != 1 || f.journal().Minted[pending.KeyID] != "" || len(f.keys) != 2 {
+		t.Fatal("pending removal failed or shortened current key grace")
+	}
+}
+
 func TestGPGRepeatedPublicationFailuresBoundProvenance(t *testing.T) {
 	f := newGPGFixture(t)
 	f.failPost = true
 	for i := 0; i < maxGPGMinted+2; i++ {
 		f.reconcile()
 	}
-	if len(f.journal().Minted) != maxGPGMinted {
+	if len(f.journal().Minted) != 1 {
 		t.Fatal("unbounded fingerprints")
 	}
 	f.now = f.now.Add(gpgGrace)
 	f.failPost = false
 	key := f.reconcile()
 	if !meta.IsStatusConditionTrue(key.Status.Conditions, "Ready") || len(f.journal().Minted) != 1 {
-		t.Fatal("capped provenance failed to recover after confirmed retirement")
+		t.Fatal("publication failed to recover after confirmed removal")
 	}
 }
 

@@ -496,8 +496,8 @@ func TestGPGOrphanDeletionWithoutProvider(t *testing.T) {
 				t.Fatal(err)
 			}
 			key = f.reconcile()
-			if contains(key.Finalizers, finalizer) {
-				t.Fatal("Orphan retained finalizer")
+			if !contains(key.Finalizers, finalizer) {
+				t.Fatal("Orphan missing state cleanup finalizer")
 			}
 			if err := f.r.Delete(ctx, &forgev1.ForgejoProvider{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "providers"}}); err != nil {
 				t.Fatal(err)
@@ -510,6 +510,13 @@ func TestGPGOrphanDeletionWithoutProvider(t *testing.T) {
 			}
 			if len(f.keys) != 1 || f.deletes != 0 {
 				t.Fatal("Orphan removed remote keys")
+			}
+			ref, _ := f.r.journalKey(key)
+			if err := f.r.Get(ctx, ref, &forgev1.ForgejoGPGKeyState{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("Orphan state retained: %v", err)
+			}
+			if err := f.r.Get(ctx, f.key, &forgev1.ForgejoGPGKey{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("Orphan finalizer retained: %v", err)
 			}
 		})
 	}

@@ -62,7 +62,7 @@ class RolloutContractTest(unittest.TestCase):
                     self.assertNotIn("*", rule["resources"])
                     if "forgejogpgkeystates" in rule["resources"]:
                         self.assertEqual(rule["resources"], ["forgejogpgkeystates"])
-                        self.assertEqual(set(rule["verbs"]), {"get", "create", "update", "patch"})
+                        self.assertEqual(set(rule["verbs"]), {"get", "create", "update", "patch", "delete"})
                         state_roles.append(name)
         self.assertEqual(len(state_roles), 1)
         bindings = [doc for doc in documents if doc["kind"] == "ClusterRoleBinding"

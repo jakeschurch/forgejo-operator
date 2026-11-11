@@ -5,6 +5,10 @@ metadata:
   labels: {{- include "forgejo-operator.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  # 2026-11-11: soak each replacement before retiring an available pod.
+  minReadySeconds: 30
+  progressDeadlineSeconds: {{ add (mul (int .Values.replicaCount) 330) 300 }}
+  strategy: {type: RollingUpdate, rollingUpdate: {maxUnavailable: 0, maxSurge: 1}}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "forgejo-operator.name" . }}
@@ -12,6 +16,7 @@ spec:
     metadata:
       labels: {{- include "forgejo-operator.labels" . | nindent 8 }}
     spec:
+      terminationGracePeriodSeconds: 60
       serviceAccountName: {{ include "forgejo-operator.name" . }}
       securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
       {{- with .Values.imagePullSecrets }}
@@ -27,6 +32,11 @@ spec:
           ports:
             - { name: metrics, containerPort: {{ .Values.metrics.port }} }
             - { name: health, containerPort: 8081 }
+          lifecycle: {preStop: {sleep: {seconds: 5}}}
+          startupProbe:
+            httpGet: {path: /healthz, port: 8081}
+            periodSeconds: 5
+            failureThreshold: 60
           livenessProbe: { httpGet: { path: /healthz, port: health } }
           readinessProbe: { httpGet: { path: /readyz, port: health } }
           resources: {{ toYaml .Values.resources | nindent 12 }}

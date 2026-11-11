@@ -3,7 +3,8 @@
 # Homelab renders this file (vmetal/ci/margo-checks/sourced/forgejo-operator).
 # nix:build builds the flake attribute of the operator image (packages.image),
 # the same package the main-branch oci-image-build pushes, so the queue probe
-# and the main build share one derivation.
+# and the main build share one derivation. The image skips the in-build tests;
+# go:test builds packages.testReport separately so failing cases stay ingestible.
 apiVersion: ci.foundrybox.dev/v1alpha1
 kind: CheckSuite
 metadata:
@@ -18,11 +19,14 @@ spec:
     url: ssh://git@forgejo-ssh.forgejo.svc.cluster.local:22/jake/forgejo-operator.git
     deployKeySecret: forgejo-operator-margo-readonly
   checks:
+    # go vet and go test run inside packages.testReport on the farm; the check
+    # ingests its go.json and fails on its exit-code, so vet needs no separate
+    # check and an unchanged Go source tree is a cache hit.
     - name: go:test
-      template: go-test
+      template: nix-go-test
       kind: test
-    - name: go:vet
-      template: go-vet
+      params:
+        attr: .#testReport
     - name: generate:drift
       template: generate-drift
       params:

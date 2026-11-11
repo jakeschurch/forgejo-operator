@@ -31,6 +31,10 @@
             env.CGO_ENABLED = "0";
             postInstall = "mv $out/bin/manager $out/bin/forgejo-operator";
           };
+          # Same binary without the in-build `go test`. The image ships this
+          # one: tests run once, in testReport (a farm cache hit on an
+          # unchanged Go source tree), not again inside the image build.
+          unchecked = operator.overrideAttrs (_: { doCheck = false; });
         in {
           default = operator;
           # Test report for the Margo `nix-go-test` check: go vet and
@@ -61,7 +65,7 @@
             tag = "latest";
             contents = [ pkgs.cacert ];
             config = {
-              Entrypoint = [ "${operator}/bin/forgejo-operator" ];
+              Entrypoint = [ "${unchecked}/bin/forgejo-operator" ];
               User = "65532:65532";
             };
           };

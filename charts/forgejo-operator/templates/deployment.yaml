@@ -29,6 +29,10 @@ spec:
           args:
             - --leader-elect
             - --metrics-secure={{ .Values.metrics.secure }}
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef: {fieldPath: metadata.namespace}
           ports:
             - { name: metrics, containerPort: {{ .Values.metrics.port }} }
             - { name: health, containerPort: 8081 }

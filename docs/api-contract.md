@@ -16,6 +16,171 @@ Credentials are never copied to specs, status, events, or logs.
 The operator watches all namespaces, but all Secret references are resolved in
 the custom resource's namespace.
 
+## User signing keys
+
+2026-11-11: `ForgejoGPGKey` manages an OpenPGP signing key for an existing user.
+It uses the referenced provider's **site administrator API token** with
+`Sudo: <user>` on Forgejo 17's `/user/emails` and `/user/gpg_keys` routes.
+The token needs user/email and GPG-key permissions. 2026-11-11: the provider
+must explicitly authorize exact logins in `spec.gpgKeys.allowedUsers`; unset or
+empty disables this feature. A CR must share the provider's namespace unless its
+namespace is explicitly listed in `spec.gpgKeys.allowedNamespaces` (no wildcards).
+Site administrator targets are always refused, even when allowlisted, before
+reading emails or key material. Protect provider writes as credential policy.
+The output Secret always lives beside the CR. For the example below, set the
+provider policy to `gpgKeys: {allowedUsers: [renovate], allowedNamespaces: [argo]}`.
+
+```yaml
+apiVersion: forgejo.jakeschurch.com/v1alpha1
+kind: ForgejoGPGKey
+metadata:
+  name: renovate
+  namespace: argo
+spec:
+  providerRef: code-jakeschurch
+  providerNamespace: forgejo
+  user: renovate
+  identity:
+    name: Renovate
+    email: renovate@localhost.invalid
+  algorithm: ed25519
+  deletionPolicy: Orphan
+  secretRef:
+    name: renovate-signing-key
+    keys:
+      privateKey: privateKey
+      publicKey: publicKey
+      keyID: keyID
+      fingerprint: fingerprint
+  rotation:
+    after: 2160h
+    gracePeriod: 336h
+```
+
+The identity email must be an activated address on that account. The operator
+checks it before generation or registration and reports `EmailVerified=False`
+on failure. It never activates or edits account emails. Provider, user, identity,
+algorithm and Secret coordinates are immutable. The default `ed25519` produces
+a v4 EdDSA signing key and cv25519 encryption subkey; `rsa4096` is also supported.
+
+An absent Secret is generated in-process using ProtonMail/go-crypto, and the
+public key is registered before the consumer Secret is created (also after
+Secret loss). The four output keys default as shown; the exports are ASCII
+armored. Existing Secrets must already be controlled by this CR and match the active or
+staged fingerprint recorded when the operator generated the key. Owner references
+alone never prove ownership: they can be forged by any Secret creator. An empty
+minting journal with an existing Secret is refused, even with a matching owner.
+A replaced private key raises `KeyRegistered=False`, reason `SecretTampered`, and
+a warning event without key material. The registered key is retained. Recovery:
+delete the tampered Secret; the operator generates and registers a fresh key and
+retires the previous proven key after grace.
+Only the public key is sent to Forgejo. Missing remote keys are re-registered
+without changing private material. Deleting a key in the Forgejo UI is therefore
+not revocation: delete its Kubernetes Secret to generate a replacement, or delete
+the CR with `deletionPolicy: Delete` to remove all its managed public keys. Status mirrors `keyID`, `fingerprint`,
+`KeyRegistered`, `EmailVerified` and the live public key IDs for humans. It never
+authorizes registration, rotation or deletion.
+
+Omit `rotation.after` to disable automatic rotation. Both durations must be
+positive; the grace defaults to 24h. A pending private key is persisted under the
+reserved `forgejoPendingPrivateKey` data key before registration; promotion
+atomically replaces the four outputs. The protected state stores the rotation
+clock and retirement deadlines **before** promotion. The
+`forgejo.jakeschurch.com/gpg-state` Secret annotation is a display mirror only;
+edits, malformed JSON and unknown IDs are ignored and repaired. Restarts replay
+this transaction without resetting grace.
+Rotation waits for previous retirement before producing another candidate.
+Consumers should reference only `privateKey`, rather than mount the entire
+Secret or use `envFrom`, which also exposes the staged private key.
+Secret/provider events wake reconciliation; remote drift and time deadlines
+are checked at most every ten minutes (one-minute retry on errors).
+
+Consumers using environment variables need a new pod to read the rotated key.
+Set grace longer than any outstanding signing run or queued head: removing an
+old public key also ends Forgejo verification of its historical signatures.
+Secret loss generates a replacement and retires keys from the durable journal.
+2026-11-11: public minting fingerprints, current/pending IDs, rotation clock,
+retirement deadlines and the deauthorization debounce are persisted in the
+cluster-scoped `ForgejoGPGKeyState` CRD (`forgejo.jakeschurch.com/v1alpha1`), named
+`forgejo-gpg-<sha256(CR UID)>`. An empty record is reserved only after provider
+policy authorizes the namespace and user and the account is confirmed non-admin.
+The old ConfigMap journal is unused and has no migration path: this feature is
+unreleased. State contains no private material and is read directly from the API,
+with resource-version conflicts preventing stale updates.
+
+**Write access to `forgejogpgkeystates` is administrator-equivalent for this
+feature.** A writer can forge minting provenance; source annotations do not
+identify the writer. RBAC on this CRD is the trust root. Treat write access to
+Argo CD Applications/AppProjects, kro ResourceGraphDefinitions (RGDs), and
+MutatingWebhookConfigurations as administrator-equivalent too: these can direct
+privileged controllers or mutate the operator's state writes. Do not grant these
+paths to untrusted tenants, reflectors or workload controllers. The chart binds
+a dedicated, unaggregated state ClusterRole only to the operator ServiceAccount;
+namespace Secret/ConfigMap permissions alone cannot write state. This binding
+does not restrict pre-existing wildcard grants or privileged deputies.
+
+The homelab RBAC audit on 2026-11-11 identified these trusted paths:
+
+- Direct state writers: cluster administrators (including `system:masters` and
+  `helm-cilium`), `argocd-application-controller`, kro, `argocd-server` (patch),
+  the storage-version migrator and generic garbage collector.
+- Argo CD deputies: Application patchers `nix-build-workflow`,
+  `argocd-tag-updater` and `argocd-notifications-controller`, and pushers to
+  `foundry-labs/foundrybox:main` through `external-repo-roots`. The `cluster-apps`
+  and `default` AppProjects allow `sourceRepos: ['*']` and all cluster resources.
+  These deputy paths are inferred from permissions, not exercised against live
+  resources. Follow-up `margo-0u0.117` scopes patchers to named Applications and
+  restricts repository sources; it is linked to `margo-0u0.96`.
+- MutatingWebhookConfiguration writers: `cert-manager-cainjector`, cnpg, kyverno,
+  vpa and `argocd-server` (patch).
+
+These principals are already administrator-equivalent in this deployment,
+including paths to the provider administrator token. Audit these direct and
+indirect grants when deploying; the chart does not narrow them.
+
+Kubernetes disallows a namespaced owner for a cluster-scoped resource. State
+therefore binds the source CR's UID, namespace and name through checked
+annotations. Reads refuse any owner reference, mismatched binding, deletion in
+progress, or state more than five seconds older than the CR. The clock tolerance
+allows small apiserver skew. State is independent of the operator namespace, so
+moving the deployment preserves provenance. These checks are defense in depth;
+RBAC remains authoritative. `POD_NAMESPACE` identifies the deployment and is
+injected by the chart. If it is empty, only the GPG controller is disabled with a
+log message; other controllers still start.
+
+Both deletion policies use a finalizer to delete cluster-scoped state before
+releasing the CR. Back up state with cluster resources while the CR exists.
+Losing a record fails closed for an existing Secret, rather than adopting it.
+Delete the Secret to mint a replacement, and clean up any unproven remote keys
+manually. Status wipes recover from protected current/pending and
+not-yet-removed IDs, never from tenant annotations or historical removed keys.
+Unknown mirror IDs produce a warning and are filtered without blocking normal
+reconciliation. Confirmed remote retirement prunes fingerprints; minting is
+capped at eight non-retiring fingerprints. Secret-loss recovery can retain more than eight
+retiring fingerprints until grace ends without blocking signing. Lost pending
+material is removed remotely before another mint, so repeated publication
+failures do not accumulate fingerprints.
+`deletionPolicy` defaults to `Orphan`: remote public keys are retained and
+Kubernetes garbage collects the owned Secret. Its finalizer only deletes local
+state and requires no provider access. `Delete` removes only this CR's proven
+journaled keys and holds its finalizer on API failures. Removing a
+user/namespace from the provider allowlist, disabling GPG management, or promoting
+the target to administrator revokes its journaled keys even with `Orphan` policy.
+Policy removal must persist across two consecutive unauthorized observations at
+least 60 seconds apart before revocation. An authorized or indeterminate
+observation resets the persisted debounce; retries occur after one minute.
+Confirmed administrator promotion revokes immediately. A transient policy blip
+therefore pauses management without immediately losing signature verification.
+Revocation and `Delete` cleanup bypass creation authorization and never touch
+unproven keys. A missing or refused journal proves no IDs: revocation is a safe
+no-op, and deletion removes state and releases the finalizer without a provider. Switch to
+`Orphan` to release deletion without a provider when proven remote keys remain.
+`prune` and `rotationNonce` do not apply.
+
+API references: [Forgejo 17 Sudo routing](https://codeberg.org/forgejo/forgejo/src/tag/v17.0.1/routers/api/v1/api.go),
+[user GPG operations](https://codeberg.org/forgejo/forgejo/src/tag/v17.0.1/routers/api/v1/user/gpg_key.go),
+and [activated email listing](https://codeberg.org/forgejo/forgejo/src/tag/v17.0.1/routers/api/v1/user/email.go).
+
 ## Repository merge detection
 
 `ForgejoRepository.spec.allowManualMerge` permits Forgejo's native API to record

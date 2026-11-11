@@ -66,6 +66,15 @@ func (c *Client) Do(ctx context.Context, method, path string, in, out any) error
 	})
 }
 
+// DoSudo performs a user operation with a site administrator's API token.
+// Forgejo 17 applies Sudo before resolving the /user routes.
+func (c *Client) DoSudo(ctx context.Context, method, path, user string, in, out any) error {
+	return c.do(ctx, method, path, in, out, func(req *http.Request) {
+		req.Header.Set("Authorization", "token "+c.token)
+		req.Header.Set("Sudo", user)
+	})
+}
+
 // DoBasic is reserved for Forgejo operations, such as token creation, that
 // explicitly require password authentication (the target account's, or a site
 // administrator's) instead of an admin token.

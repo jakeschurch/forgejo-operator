@@ -1,0 +1,81 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.5
+  name: forgejogpgkeystates.forgejo.jakeschurch.com
+spec:
+  group: forgejo.jakeschurch.com
+  names:
+    kind: ForgejoGPGKeyState
+    listKind: ForgejoGPGKeyStateList
+    plural: forgejogpgkeystates
+    singular: forgejogpgkeystate
+  scope: Cluster
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ForgejoGPGKeyState is a cluster-scoped trust root. A namespaced CR cannot
+          legally own a cluster-scoped object, so source coordinates and UID are bound
+          by annotations and checked on every read. Records are retained for audit.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              GPGKeyStateSpec is operator-only provenance and lifecycle state. Never grant
+              tenants, reflectors or aggregated user roles write access to this resource.
+            properties:
+              createdAt:
+                format: date-time
+                type: string
+              currentID:
+                type: string
+              minted:
+                additionalProperties:
+                  type: string
+                type: object
+              pendingID:
+                type: string
+              retiring:
+                items:
+                  properties:
+                    keyID:
+                      type: string
+                    removeAfter:
+                      format: date-time
+                      type: string
+                  required:
+                  - keyID
+                  - removeAfter
+                  type: object
+                type: array
+              unauthorizedSince:
+                format: date-time
+                type: string
+            required:
+            - minted
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true

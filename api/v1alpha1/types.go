@@ -48,6 +48,18 @@ type ForgejoProviderSpec struct {
 	// provider's namespace, mint tokens for the listed users. Unset refuses them.
 	// +optional
 	HumanAccessTokens *HumanAccessTokenPolicy `json:"humanAccessTokens,omitempty"`
+	// GPGKeys explicitly authorizes signing-key management. Unset disables it.
+	// +optional
+	GPGKeys *GPGKeyPolicy `json:"gpgKeys,omitempty"`
+}
+
+type GPGKeyPolicy struct {
+	// AllowedUsers are exact Forgejo logins. Empty disables signing-key management.
+	// Site administrators are always refused, even when listed here.
+	AllowedUsers []string `json:"allowedUsers,omitempty"`
+	// AllowedNamespaces opts additional CR namespaces into this provider.
+	// The provider's own namespace is permitted by default; no wildcards.
+	AllowedNamespaces []string `json:"allowedNamespaces,omitempty"`
 }
 
 // HumanAccessTokenPolicy is the provider-side half of human token minting.
@@ -496,6 +508,7 @@ type ForgejoLabelList struct {
 
 func init() {
 	SchemeBuilder.Register(
+		&ForgejoGPGKey{}, &ForgejoGPGKeyList{},
 		&ForgejoProvider{}, &ForgejoProviderList{}, &ForgejoOrganization{}, &ForgejoOrganizationList{},
 		&ForgejoTeam{}, &ForgejoTeamList{}, &ForgejoMembership{}, &ForgejoMembershipList{},
 		&ForgejoRobotAccount{}, &ForgejoRobotAccountList{}, &ForgejoAccessToken{}, &ForgejoAccessTokenList{},

@@ -20,12 +20,17 @@ type GPGKeySpec struct {
 	// +kubebuilder:validation:Enum=ed25519;rsa4096
 	Algorithm string       `json:"algorithm,omitempty"`
 	SecretRef GPGSecretRef `json:"secretRef"`
+	// Orphan retains remote public keys on deletion, preserving historical verification.
+	// +kubebuilder:default=Orphan
+	// +kubebuilder:validation:Enum=Orphan;Delete
+	DeletionPolicy DeletionPolicy `json:"deletionPolicy,omitempty"`
 	// +optional
 	Rotation *GPGKeyRotation `json:"rotation,omitempty"`
 }
 
 type GPGIdentity struct {
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Pattern=`^[^()<>]+$`
 	Name string `json:"name"`
 	// Email must be an activated email address on the target Forgejo account.
 	// +kubebuilder:validation:MinLength=3

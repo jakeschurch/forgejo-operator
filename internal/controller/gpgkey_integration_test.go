@@ -22,10 +22,18 @@ func TestIntegrationForgejoGPGKey(t *testing.T) {
 	h := newOperatorHarness(t, f)
 	api := f.client(t, f.providerToken)
 	ctx := context.Background()
+	var provider forgev1.ForgejoProvider
+	if err := h.kube.Get(ctx, client.ObjectKey{Namespace: integrationNamespace, Name: "default"}, &provider); err != nil {
+		t.Fatal(err)
+	}
+	provider.Spec.GPGKeys = &forgev1.GPGKeyPolicy{AllowedUsers: []string{"renovate"}}
+	if err := h.kube.Update(ctx, &provider); err != nil {
+		t.Fatal(err)
+	}
 	now := time.Now().UTC()
 	r := &GPGKeyReconciler{Reconciler: Reconciler{Client: h.kube, Transport: statusLog{t}}, Now: func() time.Time { return now }}
 	key := &forgev1.ForgejoGPGKey{ObjectMeta: metav1.ObjectMeta{Name: "renovate", Namespace: integrationNamespace, UID: "integration-gpg"}, Spec: forgev1.GPGKeySpec{
-		ProviderRef: "default", User: "renovate", Identity: forgev1.GPGIdentity{Name: "Renovate", Email: "renovate@example.invalid"}, SecretRef: forgev1.GPGSecretRef{Name: "signing-key"},
+		ProviderRef: "default", User: "renovate", Identity: forgev1.GPGIdentity{Name: "Renovate", Email: "renovate@example.invalid"}, SecretRef: forgev1.GPGSecretRef{Name: "signing-key"}, DeletionPolicy: forgev1.DeletionPolicyDelete,
 		Rotation: &forgev1.GPGKeyRotation{After: &metav1.Duration{Duration: time.Hour}, GracePeriod: &metav1.Duration{Duration: 30 * time.Minute}},
 	}}
 	if err := h.kube.Create(ctx, key); err != nil {

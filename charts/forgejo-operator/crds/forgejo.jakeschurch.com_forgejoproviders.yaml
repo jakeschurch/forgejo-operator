@@ -43,6 +43,25 @@ spec:
                   API reconciliation still uses URL so in-cluster traffic stays private.
                 pattern: ^https?://
                 type: string
+              gpgKeys:
+                description: GPGKeys explicitly authorizes signing-key management.
+                  Unset disables it.
+                properties:
+                  allowedNamespaces:
+                    description: |-
+                      AllowedNamespaces opts additional CR namespaces into this provider.
+                      The provider's own namespace is permitted by default; no wildcards.
+                    items:
+                      type: string
+                    type: array
+                  allowedUsers:
+                    description: |-
+                      AllowedUsers are exact Forgejo logins. Empty disables signing-key management.
+                      Site administrators are always refused, even when listed here.
+                    items:
+                      type: string
+                    type: array
+                type: object
               humanAccessTokens:
                 description: |-
                   HumanAccessTokens lets ForgejoAccessTokens with accountType Human, in this

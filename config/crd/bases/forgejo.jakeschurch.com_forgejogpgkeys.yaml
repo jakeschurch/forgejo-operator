@@ -48,6 +48,14 @@ spec:
                 - ed25519
                 - rsa4096
                 type: string
+              deletionPolicy:
+                default: Orphan
+                description: Orphan retains remote public keys on deletion, preserving
+                  historical verification.
+                enum:
+                - Orphan
+                - Delete
+                type: string
               identity:
                 properties:
                   email:
@@ -57,6 +65,7 @@ spec:
                     type: string
                   name:
                     minLength: 1
+                    pattern: ^[^()<>]+$
                     type: string
                 required:
                 - email

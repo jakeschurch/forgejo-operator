@@ -21,10 +21,14 @@ the custom resource's namespace.
 2026-11-11: `ForgejoGPGKey` manages an OpenPGP signing key for an existing user.
 It uses the referenced provider's **site administrator API token** with
 `Sudo: <user>` on Forgejo 17's `/user/emails` and `/user/gpg_keys` routes.
-The token needs user/email and GPG-key permissions. `providerNamespace` may
-reference a shared provider; the output Secret always lives beside the CR.
-Creating these CRs permits acting on that provider's users, so restrict CR and
-provider write access accordingly.
+The token needs user/email and GPG-key permissions. 2026-11-11: the provider
+must explicitly authorize exact logins in `spec.gpgKeys.allowedUsers`; unset or
+empty disables this feature. A CR must share the provider's namespace unless its
+namespace is explicitly listed in `spec.gpgKeys.allowedNamespaces` (no wildcards).
+Site administrator targets are always refused, even when allowlisted, before
+reading emails or key material. Protect provider writes as credential policy.
+The output Secret always lives beside the CR. For the example below, set the
+provider policy to `gpgKeys: {allowedUsers: [renovate], allowedNamespaces: [argo]}`.
 
 ```yaml
 apiVersion: forgejo.jakeschurch.com/v1alpha1
@@ -40,6 +44,7 @@ spec:
     name: Renovate
     email: renovate@localhost.invalid
   algorithm: ed25519
+  deletionPolicy: Orphan
   secretRef:
     name: renovate-signing-key
     keys:
@@ -49,7 +54,7 @@ spec:
       fingerprint: fingerprint
   rotation:
     after: 2160h
-    gracePeriod: 24h
+    gracePeriod: 336h
 ```
 
 The identity email must be an activated address on that account. The operator
@@ -58,12 +63,15 @@ on failure. It never activates or edits account emails. Provider, user, identity
 algorithm and Secret coordinates are immutable. The default `ed25519` produces
 a v4 EdDSA signing key and cv25519 encryption subkey; `rsa4096` is also supported.
 
-An absent Secret is generated in-process using ProtonMail/go-crypto. The four
-output keys default as shown; the two key exports are ASCII armored. An existing
-unowned Secret can supply a matching, unencrypted private key; public metadata is
-derived from it and the CR takes ownership. Secrets with another owner are refused.
+An absent Secret is generated in-process using ProtonMail/go-crypto, and the
+public key is registered before the consumer Secret is created (also after
+Secret loss). The four output keys default as shown; the exports are ASCII
+armored. Existing Secrets must already be controlled by this CR; unowned or
+foreign Secrets are refused rather than adopted.
 Only the public key is sent to Forgejo. Missing remote keys are re-registered
-without changing private material. Status adds `keyID`, `fingerprint`,
+without changing private material. Deleting a key in the Forgejo UI is therefore
+not revocation: delete its Kubernetes Secret to generate a replacement, or delete
+the CR with `deletionPolicy: Delete` to remove all its managed public keys. Status adds `keyID`, `fingerprint`,
 `KeyRegistered`, `EmailVerified` and a public key-ID cleanup journal.
 
 Omit `rotation.after` to disable automatic rotation. Both durations must be
@@ -72,6 +80,8 @@ reserved `forgejoPendingPrivateKey` data key before registration; promotion
 atomically replaces the four outputs and stores a retirement deadline in the
 `forgejo.jakeschurch.com/gpg-state` annotation. Restarts replay this transaction.
 Rotation waits for previous retirement before producing another candidate.
+Consumers should reference only `privateKey`, rather than mount the entire
+Secret or use `envFrom`, which also exposes the staged private key.
 Secret/provider events wake reconciliation; remote drift and time deadlines
 are checked at most every ten minutes (one-minute retry on errors).
 
@@ -79,9 +89,12 @@ Consumers using environment variables need a new pod to read the rotated key.
 Set grace longer than any outstanding signing run or queued head: removing an
 old public key also ends Forgejo verification of its historical signatures.
 Secret loss generates a replacement and retires keys from the durable journal.
-Deletion always removes only this CR's journaled keys and holds its finalizer on
-API failures; Kubernetes garbage collects its owned Secret afterwards.
-`deletionPolicy`, `prune` and `rotationNonce` do not apply to this resource.
+If status is lost during grace, the journal is rebuilt from the owned Secret's
+retirement annotation intersected with keys still present on the target account.
+`deletionPolicy` defaults to `Orphan`: no finalizer, remote public keys retained,
+and Kubernetes garbage collects the owned Secret. `Delete` removes only this
+CR's journaled keys and holds its finalizer on API failures. Switch to `Orphan`
+to release deletion without a provider. `prune` and `rotationNonce` do not apply.
 
 API references: [Forgejo 17 Sudo routing](https://codeberg.org/forgejo/forgejo/src/tag/v17.0.1/routers/api/v1/api.go),
 [user GPG operations](https://codeberg.org/forgejo/forgejo/src/tag/v17.0.1/routers/api/v1/user/gpg_key.go),

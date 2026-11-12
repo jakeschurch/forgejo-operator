@@ -413,8 +413,8 @@ func (r *GPGKeyReconciler) reconcileGPG(ctx context.Context, api *forgeapi.Clien
 			return err
 		}
 		state = journal.lifecycle()
-		if journal.activeMinted() >= maxGPGMinted {
-			return errors.New("GPG minting limit reached; waiting for retirement")
+		if err := journal.mintLimit(); err != nil {
+			return err
 		}
 		material, err := credentials.GenerateGPG(key.Spec.Identity.Name, key.Spec.Identity.Email, key.Spec.Algorithm, r.now())
 		if err != nil {
@@ -500,8 +500,8 @@ func (r *GPGKeyReconciler) reconcileGPG(ctx context.Context, api *forgeapi.Clien
 	state = journal.lifecycle()
 	due := key.Spec.Rotation != nil && key.Spec.Rotation.After != nil && !r.now().Before(state.CreatedAt.Add(key.Spec.Rotation.After.Duration))
 	if due && len(state.Retiring) == 0 && len(secret.Data[gpgPendingPrivate]) == 0 {
-		if journal.activeMinted() >= maxGPGMinted {
-			return errors.New("GPG minting limit reached; waiting for retirement")
+		if err := journal.mintLimit(); err != nil {
+			return err
 		}
 		pending, err := credentials.GenerateGPG(key.Spec.Identity.Name, key.Spec.Identity.Email, key.Spec.Algorithm, r.now())
 		if err != nil {

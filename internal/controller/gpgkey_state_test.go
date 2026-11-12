@@ -3,7 +3,9 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -165,6 +167,84 @@ func TestGPGSecretDeletionLoopKeepsSigning(t *testing.T) {
 	f.reconcile()
 	if len(f.keys) != 1 || len(f.journal().Minted) != 1 {
 		t.Fatal("recovery keys failed to retire")
+	}
+}
+
+func TestGPGSecretDeletionTotalCeilingAndRecovery(t *testing.T) {
+	f := newGPGFixture(t)
+	key := f.reconcile()
+	journal := f.journal()
+	// Seed published history just below the ceiling; the smaller deletion-loop
+	// test above exercises repeated real minting. Use normal 50-key pages here
+	// to avoid quadratic one-key pagination and its production rate limit.
+	for i := 1; i < maxGPGTotalMinted-1; i++ {
+		id := fmt.Sprintf("retired-%d", i)
+		journal.Minted[id] = id
+		journal.Retiring = append(journal.Retiring, forgev1.GPGKeyRetirement{KeyID: id, RemoveAfter: metav1.NewTime(f.now.Add(gpgGrace))})
+		f.keys = append(f.keys, remoteGPGKey{ID: int64(100 + i), KeyID: id})
+	}
+	if err := f.r.writeGPGJournal(context.Background(), key, journal); err != nil {
+		t.Fatal(err)
+	}
+	f.r.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodGet && req.URL.Path == "/api/v1/user/gpg_keys" {
+			page, _ := strconv.Atoi(req.URL.Query().Get("page"))
+			start := min((page-1)*50, len(f.keys))
+			data, _ := json.Marshal(f.keys[start:min(start+50, len(f.keys))])
+			return response(200, string(data)), nil
+		}
+		return f.serve(req)
+	})
+	if err := f.r.Delete(context.Background(), f.secret()); err != nil {
+		t.Fatal(err)
+	}
+	if key := f.reconcile(); !meta.IsStatusConditionTrue(key.Status.Conditions, "Ready") || len(f.journal().Minted) != maxGPGTotalMinted {
+		t.Fatalf("recovery below total ceiling failed: %+v", key.Status.Conditions)
+	}
+	if err := f.r.Delete(context.Background(), f.secret()); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		key := f.reconcile()
+		if meta.IsStatusConditionTrue(key.Status.Conditions, "Ready") || f.posts != 2 || len(f.journal().Minted) != maxGPGTotalMinted || f.deletes != 0 {
+			t.Fatal("Secret loss exceeded total ceiling or shortened grace")
+		}
+		if err := f.r.Get(context.Background(), client.ObjectKey{Namespace: f.key.Namespace, Name: "signing-key"}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("replacement Secret created at ceiling: %v", err)
+		}
+	}
+	f.now = f.now.Add(gpgGrace)
+	f.failDelete = true
+	f.reconcile()
+	if f.posts != 2 || len(f.journal().Minted) != maxGPGTotalMinted {
+		t.Fatal("unconfirmed remote retirement freed capacity")
+	}
+	f.failDelete = false
+	key = f.reconcile()
+	if !meta.IsStatusConditionTrue(key.Status.Conditions, "Ready") || len(f.journal().Minted) != 1 || len(f.keys) != 1 || f.posts != 3 {
+		t.Fatal("confirmed retirement did not restore replacement minting")
+	}
+}
+
+func TestGPGMintJournalEnforcesBothCaps(t *testing.T) {
+	for _, retiring := range []bool{false, true} {
+		t.Run(fmt.Sprint(retiring), func(t *testing.T) {
+			journal := &gpgJournal{GPGKeyStateSpec: forgev1.GPGKeyStateSpec{Minted: map[string]string{}}}
+			limit := maxGPGMinted
+			if retiring {
+				limit = maxGPGTotalMinted
+			}
+			for i := 0; i < limit; i++ {
+				id := fmt.Sprint(i)
+				journal.Minted[id] = id
+				if retiring {
+					journal.Retiring = append(journal.Retiring, forgev1.GPGKeyRetirement{KeyID: id})
+				}
+			}
+			if err := (&GPGKeyReconciler{}).mintGPGJournal(context.Background(), nil, journal, &credentials.GPGKey{KeyID: "new"}); err == nil || len(journal.Minted) != limit || journal.PendingID != "" {
+				t.Fatal("mint journal failed to reject at capacity before mutation")
+			}
+		})
 	}
 }
 

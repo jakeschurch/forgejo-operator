@@ -149,15 +149,22 @@ injected by the chart. If it is empty, only the GPG controller is disabled with 
 log message; other controllers still start.
 
 Both deletion policies use a finalizer to delete cluster-scoped state before
-releasing the CR. Back up state with cluster resources while the CR exists.
+releasing the CR. For uninstall, keep the operator running while deleting
+ForgejoGPGKey CRs or their namespaces, and wait for their finalizers to finish
+before removing the operator, its RBAC, or the CRDs. This order also applies to
+`Orphan`, which still needs the operator to remove local state. Keep provider
+credentials available until `Delete` cleanup completes.
+Back up state with cluster resources while the CR exists.
 Losing a record fails closed for an existing Secret, rather than adopting it.
 Delete the Secret to mint a replacement, and clean up any unproven remote keys
 manually. Status wipes recover from protected current/pending and
 not-yet-removed IDs, never from tenant annotations or historical removed keys.
 Unknown mirror IDs produce a warning and are filtered without blocking normal
 reconciliation. Confirmed remote retirement prunes fingerprints; minting is
-capped at eight non-retiring fingerprints. Secret-loss recovery can retain more than eight
-retiring fingerprints until grace ends without blocking signing. Lost pending
+capped at eight non-retiring fingerprints and 64 total fingerprints, including
+retiring keys. Secret-loss recovery can retain more than eight total fingerprints
+during grace, but reaching 64 blocks replacement minting until confirmed remote
+retirement frees capacity; it never shortens grace. Lost pending
 material is removed remotely before another mint, so repeated publication
 failures do not accumulate fingerprints.
 `deletionPolicy` defaults to `Orphan`: remote public keys are retained and

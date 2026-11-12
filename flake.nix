@@ -9,13 +9,13 @@
       # flake itself stay out, so editing them keeps the package outPath (and
       # so the farm/CSI cache hit) unchanged. No Go source uses go:embed and
       # no package ships testdata; if either appears, add it here.
-      mkSrc = lib: lib.fileset.toSource {
+      mkSrc = lib: { keep ? ./. }: lib.fileset.toSource {
         root = ./.;
-        fileset = lib.fileset.unions [
+        fileset = lib.fileset.intersection keep (lib.fileset.unions [
           ./go.mod
           ./go.sum
           (lib.fileset.fileFilter (file: file.hasExt "go") ./.)
-        ];
+        ]);
       };
     in {
       packages = forAllSystems (system:
@@ -24,7 +24,7 @@
           operator = pkgs.buildGoModule {
             pname = "forgejo-operator";
             version = "0.1.0";
-            src = mkSrc pkgs.lib;
+            src = mkSrc pkgs.lib { };
             vendorHash = "sha256-xr0iDFo2mxsZ4KPs/3qV6UP48PCGQ5JgD8uQXOPPSdk=";
             subPackages = [ "cmd/manager" ];
             ldflags = [ "-s" "-w" ];
@@ -75,8 +75,26 @@
           pkgs = import nixpkgs { inherit system; };
           operator = self.packages.${system}.default;
           report = self.packages.${system}.testReport;
+          inherit (pkgs) lib;
+          # 2026-11-12: remove documentation/metadata to model its strongest edit.
+          fs = lib.fileset;
+          docFiles = fs.difference
+            (fs.fileFilter (file:
+              file.hasExt "md" || lib.hasPrefix "README" file.name
+              || lib.hasPrefix "CHANGELOG" file.name
+              || builtins.elem file.name [ "AGENTS.md" "CLAUDE.md" "Makefile" "flake.nix" "flake.lock" "Dockerfile" "mkdocs.yml" ]) ./.)
+            (fs.unions [ ]);
+          docOnly = fs.unions ([ docFiles ] ++ map fs.maybeMissing [
+            ./docs ./documentation ./.forgejo ./.github ./.beads ./charts ./deploy ./config ./ci
+          ]);
+          without = remove: mkSrc lib { keep = fs.difference ./. remove; };
+          srcStability =
+            assert (without docOnly).outPath == operator.src.outPath;
+            assert (without ./go.mod).outPath != operator.src.outPath;
+            pkgs.runCommand "forgejo-operator-src-stability" { } "touch $out";
         in {
           inherit (self.packages.${system}) default;
+          src-stability = srcStability;
           tests = operator;
           # The report derivation always builds; this is the check that fails
           # when vet or a test did.
@@ -88,7 +106,7 @@
           # Only Go build inputs are in the source, so a docs-only change
           # cannot move the package outPath.
           source-scope = pkgs.runCommand "forgejo-operator-source-scope" { } ''
-            cd ${mkSrc pkgs.lib}
+            cd ${mkSrc pkgs.lib { }}
             bad=$(find . -type f ! -name '*.go' ! -name go.mod ! -name go.sum)
             if [ -n "$bad" ]; then echo "non-Go-build files in source:" "$bad"; exit 1; fi
             touch $out

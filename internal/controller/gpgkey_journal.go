@@ -25,6 +25,10 @@ const gpgSourceName = "forgejo.jakeschurch.com/gpg-source-name"
 const gpgSourceNamespace = "forgejo.jakeschurch.com/gpg-source-namespace"
 const maxGPGMinted = 8
 
+// 2026-11-11: repeated Secret loss must stay well below Forgejo list limits,
+// even while published keys are retained for their full retirement grace.
+const maxGPGTotalMinted = 64
+
 var errGPGStateRefused = errors.New("refusing foreign or pre-existing GPG provenance state")
 
 type gpgJournal struct {
@@ -129,8 +133,8 @@ func (j *gpgJournal) setLifecycle(state gpgState) {
 	}
 }
 
-// Recovery must retain old published keys for grace without exhausting minting
-// capacity. Never-staged pending keys are removed before another recovery mint.
+// Recovery retains old published keys for grace outside the active cap, but
+// still within the total cap. Lost pending keys are removed before another mint.
 func (j *gpgJournal) activeMinted() int {
 	count := 0
 	for id := range j.Minted {
@@ -144,12 +148,19 @@ func (j *gpgJournal) activeMinted() int {
 // Called only with material just generated in this process, before publishing
 // either a Secret or a public key. No Secret/status recovery may call this.
 func (r *GPGKeyReconciler) mintGPGJournal(ctx context.Context, key *forgev1.ForgejoGPGKey, journal *gpgJournal, material *credentials.GPGKey) error {
-	if journal.activeMinted() >= maxGPGMinted {
-		return errors.New("GPG minting limit reached; waiting for retirement")
+	if err := journal.mintLimit(); err != nil {
+		return err
 	}
 	journal.Minted[material.KeyID] = material.Fingerprint
 	journal.PendingID = material.KeyID
 	return r.writeGPGJournal(ctx, key, journal)
+}
+
+func (j *gpgJournal) mintLimit() error {
+	if len(j.Minted) >= maxGPGTotalMinted || j.activeMinted() >= maxGPGMinted {
+		return errors.New("GPG minting limit reached; waiting for retirement")
+	}
+	return nil
 }
 
 func (j *gpgJournal) accepts(material *credentials.GPGKey) bool {

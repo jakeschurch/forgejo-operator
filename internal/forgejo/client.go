@@ -1,3 +1,4 @@
+// Package forgejo is a minimal REST client for the Forgejo API.
 package forgejo
 
 import (

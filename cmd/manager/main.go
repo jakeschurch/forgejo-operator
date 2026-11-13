@@ -39,14 +39,14 @@ func main() {
 	if secureMetrics {
 		metrics.FilterProvider = filters.WithAuthenticationAndAuthorization
 	}
-	manager, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	manager, err := ctrl.NewManager(ctrl.GetConfigOrDie(), leaderElectionOptions(ctrl.Options{
 		Scheme: scheme, Metrics: metrics, HealthProbeBindAddress: probeAddress,
 		LeaderElection: leaderElection, LeaderElectionID: "forgejo-operator.forgejo.jakeschurch.com",
 		// 2026-11-11: warm standby sources before readiness can allow retirement
 		// of the old leader; release the lease after manager shutdown completes.
 		Controller:                    config.Controller{EnableWarmup: ptr.To(true)},
 		LeaderElectionReleaseOnCancel: true,
-	})
+	}))
 	if err != nil {
 		os.Exit(1)
 	}
@@ -97,4 +97,23 @@ func cacheReady(ctx context.Context, cache cacheSyncer) healthz.Checker {
 		}
 		return ctx.Err()
 	}
+}
+
+// 2026-11-13 (margo-0u0.3): the default 2s retry causes 29 Lease PUTs/min
+// per operator. Use 10s retries to reduce API writes; crash failover increasing
+// from 15s to 60s is accepted.
+const (
+	leaderElectionLeaseDuration = 60 * time.Second
+	leaderElectionRenewDeadline = 40 * time.Second
+	leaderElectionRetryPeriod   = 10 * time.Second
+)
+
+func leaderElectionOptions(options ctrl.Options) ctrl.Options {
+	leaseDuration := leaderElectionLeaseDuration
+	renewDeadline := leaderElectionRenewDeadline
+	retryPeriod := leaderElectionRetryPeriod
+	options.LeaseDuration = &leaseDuration
+	options.RenewDeadline = &renewDeadline
+	options.RetryPeriod = &retryPeriod
+	return options
 }

@@ -23,4 +23,7 @@ nix flake check
 Releases use SemVer tags (`v0.x.y`). Images are published to
 `harbor.oci-registry.svc.cluster.local/foundry/forgejo-operator`.
 
+CI note: merge-queue probes stage the main image build on the trusted farm so
+the following main build is a cache hit.
+
 Licensed under Apache-2.0.

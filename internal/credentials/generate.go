@@ -1,3 +1,4 @@
+// Package credentials generates and registers operator-managed credentials.
 package credentials
 
 import (

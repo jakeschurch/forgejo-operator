@@ -188,6 +188,69 @@ API references: [Forgejo 17 Sudo routing](https://codeberg.org/forgejo/forgejo/s
 [user GPG operations](https://codeberg.org/forgejo/forgejo/src/tag/v17.0.1/routers/api/v1/user/gpg_key.go),
 and [activated email listing](https://codeberg.org/forgejo/forgejo/src/tag/v17.0.1/routers/api/v1/user/email.go).
 
+## User SSH keys (signing)
+
+2026-11-21: `ForgejoSSHKey` declares an existing user's SSH public key, such as
+the key they sign commits with (`git config gpg.format ssh`). Forgejo marks an
+SSH-signed commit Verified only when the key is on the committer's account with
+`verified=true` and the committer email is an activated address of that account.
+The operator never holds the private key: it registers the public half and
+mirrors Forgejo's `verified` flag into `status.verified` and a `Verified`
+condition.
+
+Authorization mirrors `ForgejoGPGKey`: the provider must list the exact login in
+`spec.sshKeys.allowedUsers`; a CR outside the provider's namespace also needs
+its namespace in `spec.sshKeys.allowedNamespaces`; site administrator targets
+are always refused. Forgejo has no signing-only key type, so a registered key
+also authenticates git-over-SSH as that user: treat this policy as credential
+policy. Registration uses the provider's admin token with `Sudo: <user>` on
+`POST /user/keys` (the token needs user write scope). Lookups use
+`GET /users/{user}/keys?fingerprint=` because `/user/keys?fingerprint=` ignores
+the owner and would match another account's key.
+
+The key is matched by fingerprint and adopted if present, whatever its title;
+it is never deleted and recreated, because a new key row is unverified.
+`spec.publicKey`, `spec.user` and `spec.providerRef` are immutable. A
+fingerprint Forgejo already holds for another account or as a deploy key
+reports `Ready=False, reason=KeyInUse`. `deletionPolicy` defaults to `Orphan`;
+`Delete` removes only the recorded key while it still carries the fingerprint.
+
+```yaml
+apiVersion: forgejo.jakeschurch.com/v1alpha1
+kind: ForgejoSSHKey
+metadata:
+  name: jake-signing
+  namespace: forgejo
+spec:
+  providerRef: code-jakeschurch
+  user: jake
+  title: git signing key
+  publicKey: ssh-ed25519 AAAA... git signing key
+  deletionPolicy: Orphan
+```
+
+### Ownership proof (one time, by the key owner)
+
+Forgejo 17 sets `verified` only through the web settings form (`verify_ssh`):
+the owner signs a token that changes every minute, with the namespace set to
+Forgejo's `DOMAIN`. There is no API route, and the operator has neither the
+private key nor a web session as the user, so this step cannot be declarative.
+Until it is done the CR reports `Verified=False, reason=OwnershipProofRequired`
+and `status.verificationURL`, and is re-checked every two minutes:
+
+1. Signed in to Forgejo as the user, open `status.verificationURL`
+   (`<externalURL>/user/settings/keys?verify_ssh=<fingerprint>`).
+2. Sign the token the page shows, with the key in your agent:
+   `echo -n '<token>' | ssh-keygen -Y sign -n <DOMAIN> -f <(echo '<publicKey>')`
+   (the page prints this command with the right `DOMAIN`).
+3. Paste the armored signature and submit, within about a minute.
+
+The proof survives operator restarts and reconciles; it is lost only if the key
+is removed from the account. Forgejo verifies commit signatures when they are
+displayed, so commits already pushed show as Verified afterwards. Forgejo before
+17 does not report `verified` over the API; the condition is then
+`Unknown, reason=VerificationNotReported`.
+
 ## Repository merge detection
 
 `ForgejoRepository.spec.allowManualMerge` permits Forgejo's native API to record

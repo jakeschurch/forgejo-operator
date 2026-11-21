@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -295,16 +294,11 @@ func (r *GPGKeyReconciler) authorizedGPGClient(ctx context.Context, key *forgev1
 	if err != nil {
 		return nil, err
 	}
-	var user struct {
-		IsAdmin *bool `json:"is_admin"`
-	}
-	if err := api.Do(ctx, http.MethodGet, "users/"+url.PathEscape(key.Spec.User), nil, &user); err != nil {
+	admin, err := isSiteAdmin(ctx, api, key.Spec.User)
+	if err != nil {
 		return nil, err
 	}
-	if user.IsAdmin == nil {
-		return nil, errors.New("unknown administrator status")
-	}
-	if *user.IsAdmin {
+	if admin {
 		return nil, errGPGAdmin
 	}
 	if policyErr != nil {

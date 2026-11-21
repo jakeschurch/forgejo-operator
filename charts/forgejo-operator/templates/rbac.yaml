@@ -4,7 +4,7 @@ metadata:
   name: {{ include "forgejo-operator.name" . }}
 rules:
   - apiGroups: ["forgejo.jakeschurch.com"]
-    resources: ["forgejoproviders", "forgejoorganizations", "forgejorepositories", "forgejoaccesstokens", "forgejobranchprotections", "forgejocollaborators", "forgejodeploykeys", "forgejogpgkeys", "forgejolabels", "forgejomemberships", "forgejopushmirrors", "forgejorobotaccounts", "forgejotagprotections", "forgejoteams", "forgejowebhooks"]
+    resources: ["forgejoproviders", "forgejoorganizations", "forgejorepositories", "forgejoaccesstokens", "forgejobranchprotections", "forgejocollaborators", "forgejodeploykeys", "forgejogpgkeys", "forgejolabels", "forgejomemberships", "forgejopushmirrors", "forgejorobotaccounts", "forgejosshkeys", "forgejotagprotections", "forgejoteams", "forgejowebhooks"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["forgejo.jakeschurch.com"]
     resources: ["*/status", "*/finalizers"]

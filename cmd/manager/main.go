@@ -55,6 +55,7 @@ func main() {
 		(&controller.ProviderReconciler{Reconciler: base}).SetupWithManager,
 		(&controller.OrganizationReconciler{Reconciler: base}).SetupWithManager,
 		(&controller.RepositoryReconciler{Reconciler: base}).SetupWithManager,
+		(&controller.SSHKeyReconciler{Reconciler: base}).SetupWithManager,
 	}
 	if namespace := os.Getenv("POD_NAMESPACE"); namespace != "" {
 		setups = append(setups, (&controller.GPGKeyReconciler{Reconciler: base, StateNamespace: namespace}).SetupWithManager)

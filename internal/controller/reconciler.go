@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	forgev1 "github.com/jakeschurch/forgejo-operator/api/v1alpha1"
@@ -66,6 +67,8 @@ func listFor(object client.Object) client.ObjectList {
 		return &forgev1.ForgejoCollaboratorList{}
 	case *forgev1.ForgejoDeployKey:
 		return &forgev1.ForgejoDeployKeyList{}
+	case *forgev1.ForgejoSSHKey:
+		return &forgev1.ForgejoSSHKeyList{}
 	case *forgev1.ForgejoWebhook:
 		return &forgev1.ForgejoWebhookList{}
 	case *forgev1.ForgejoPushMirror:
@@ -99,6 +102,14 @@ func naturalKey(object client.Object) string {
 		return v.Spec.ProviderRef + "/" + v.Spec.Owner + "/" + v.Spec.Repository + "/" + v.Spec.Username
 	case *forgev1.ForgejoDeployKey:
 		return v.Spec.ProviderRef + "/" + v.Spec.Owner + "/" + v.Spec.Repository + "/" + v.Spec.Title
+	case *forgev1.ForgejoSSHKey:
+		// Forgejo fingerprints are instance-unique; fall back to the raw line
+		// when it does not parse, so two identical bad lines still collide.
+		fingerprint, err := userKeyFingerprint(v.Spec.PublicKey)
+		if err != nil {
+			fingerprint = strings.TrimSpace(v.Spec.PublicKey)
+		}
+		return v.Spec.ProviderRef + "/" + fingerprint
 	case *forgev1.ForgejoWebhook:
 		return v.Spec.ProviderRef + "/" + v.Spec.Owner + "/" + v.Spec.Repository + "/" + v.Spec.URL
 	case *forgev1.ForgejoPushMirror:

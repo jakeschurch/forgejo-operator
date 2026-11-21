@@ -62,7 +62,11 @@ func startForgejo(t *testing.T) *forgejoInstance {
 HTTP_ADDR = 127.0.0.1
 HTTP_PORT = %d
 ROOT_URL = %s/
-DISABLE_SSH = true
+; SSH stays enabled (Forgejo refuses user SSH keys otherwise) but no server is
+; started; authorized_keys lands under the throwaway HOME.
+DISABLE_SSH = false
+START_SSH_SERVER = false
+SSH_PORT = 22
 OFFLINE_MODE = true
 [database]
 DB_TYPE = sqlite3
@@ -205,7 +209,7 @@ func newOperatorHarness(t *testing.T, f *forgejoInstance, allowed ...string) *op
 	_ = corev1.AddToScheme(scheme)
 	_ = forgev1.AddToScheme(scheme)
 	kube := fake.NewClientBuilder().WithScheme(scheme).
-		WithStatusSubresource(&forgev1.ForgejoAccessToken{}, &forgev1.ForgejoRobotAccount{}, &forgev1.ForgejoRepository{}, &forgev1.ForgejoGPGKey{}).
+		WithStatusSubresource(&forgev1.ForgejoAccessToken{}, &forgev1.ForgejoRobotAccount{}, &forgev1.ForgejoRepository{}, &forgev1.ForgejoGPGKey{}, &forgev1.ForgejoSSHKey{}).
 		WithObjects(
 			&corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{Name: "provider-token", Namespace: integrationNamespace},

@@ -51,6 +51,20 @@ type ForgejoProviderSpec struct {
 	// GPGKeys explicitly authorizes signing-key management. Unset disables it.
 	// +optional
 	GPGKeys *GPGKeyPolicy `json:"gpgKeys,omitempty"`
+	// SSHKeys explicitly authorizes ForgejoSSHKey for the listed users. A
+	// registered key authenticates git-over-SSH as that user, so this is
+	// credential policy. Unset disables it.
+	// +optional
+	SSHKeys *SSHKeyPolicy `json:"sshKeys,omitempty"`
+}
+
+type SSHKeyPolicy struct {
+	// AllowedUsers are exact Forgejo logins. Empty disables SSH key management.
+	// Site administrators are always refused, even when listed here.
+	AllowedUsers []string `json:"allowedUsers,omitempty"`
+	// AllowedNamespaces opts additional CR namespaces into this provider.
+	// The provider's own namespace is permitted by default; no wildcards.
+	AllowedNamespaces []string `json:"allowedNamespaces,omitempty"`
 }
 
 type GPGKeyPolicy struct {

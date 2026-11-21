@@ -98,6 +98,27 @@ spec:
                 type: object
               requestTimeout:
                 type: string
+              sshKeys:
+                description: |-
+                  SSHKeys explicitly authorizes ForgejoSSHKey for the listed users. A
+                  registered key authenticates git-over-SSH as that user, so this is
+                  credential policy. Unset disables it.
+                properties:
+                  allowedNamespaces:
+                    description: |-
+                      AllowedNamespaces opts additional CR namespaces into this provider.
+                      The provider's own namespace is permitted by default; no wildcards.
+                    items:
+                      type: string
+                    type: array
+                  allowedUsers:
+                    description: |-
+                      AllowedUsers are exact Forgejo logins. Empty disables SSH key management.
+                      Site administrators are always refused, even when listed here.
+                    items:
+                      type: string
+                    type: array
+                type: object
               tokenSecretRef:
                 description: SecretKeySelector selects a key of a Secret.
                 properties:

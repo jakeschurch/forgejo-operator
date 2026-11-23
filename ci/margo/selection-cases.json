@@ -95,6 +95,26 @@
       ]
     },
     {
+      "name": "gitignore",
+      "changed": [
+        ".gitignore"
+      ],
+      "selected": [
+        "go:test",
+        "generate:drift"
+      ]
+    },
+    {
+      "name": "nested-gitignore",
+      "changed": [
+        "config/.gitignore"
+      ],
+      "selected": [
+        "go:test",
+        "generate:drift"
+      ]
+    },
+    {
       "name": "vendor-manifest",
       "changed": [
         "vendor/modules.txt"

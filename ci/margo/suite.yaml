@@ -32,6 +32,7 @@ spec:
         attr: .#testReport
     - name: generate:drift
       paths:
+        - "**/.gitignore"
         - api/**
         - config/crd/**
         - charts/forgejo-operator/crds/**

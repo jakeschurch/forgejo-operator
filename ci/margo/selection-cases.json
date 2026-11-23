@@ -1,0 +1,101 @@
+{
+  "repository": "forgejo-operator",
+  "suite": "suite.yaml",
+  "shared": [
+    "ci/margo/suite.yaml",
+    "ci/margo/templates/new.yaml",
+    "ci/margo/check.sh",
+    "ci/margo/rendered/ci.json",
+    "flake.lock",
+    "flake.nix",
+    "nix/toolchain.nix",
+    ".tool-versions"
+  ],
+  "cases": [
+    {
+      "name": "docs",
+      "changed": [
+        "docs/new.md"
+      ],
+      "selected": [
+        "go:test"
+      ]
+    },
+    {
+      "name": "app",
+      "changed": [
+        "charts/forgejo-operator/templates/deployment.yaml"
+      ],
+      "selected": [
+        "go:test",
+        "helm:chart"
+      ]
+    },
+    {
+      "name": "crd",
+      "changed": [
+        "charts/forgejo-operator/crds/forgejo.yaml"
+      ],
+      "selected": [
+        "go:test",
+        "helm:chart",
+        "generate:drift"
+      ]
+    },
+    {
+      "name": "go",
+      "changed": [
+        "internal/controller/controller.go"
+      ],
+      "selected": [
+        "go:test",
+        "nix:build"
+      ]
+    },
+    {
+      "name": "unknown",
+      "changed": [
+        "future/data.bin"
+      ],
+      "selected": [
+        "go:test"
+      ]
+    },
+    {
+      "name": "rendered-ci",
+      "changed": [
+        "ci/margo/rendered/checks.json"
+      ],
+      "selected": [
+        "go:test",
+        "generate:drift",
+        "helm:chart",
+        "nix:build"
+      ]
+    },
+    {
+      "name": "flake-lock",
+      "changed": [
+        "flake.lock"
+      ],
+      "selected": [
+        "go:test",
+        "generate:drift",
+        "helm:chart",
+        "nix:build"
+      ]
+    },
+    {
+      "name": "check-script",
+      "changed": [
+        "ci/margo/check.sh"
+      ],
+      "selected": [
+        "go:test",
+        "generate:drift",
+        "helm:chart",
+        "nix:build"
+      ]
+    }
+  ]
+}

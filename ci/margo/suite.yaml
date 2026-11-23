@@ -1,3 +1,6 @@
+# Path selection uses OR; every filtered check includes its own CI definitions.
+# # go:test stays unconditional as the repository regression backstop: Go discovers
+# packages across the repository. Unknown paths must not produce an empty green plan.
 # Native checks qualified before queue activation; every selected check blocks landing.
 #
 # Homelab renders this file (vmetal/ci/margo-checks/sourced/forgejo-operator).
@@ -28,16 +31,58 @@ spec:
       params:
         attr: .#testReport
     - name: generate:drift
+      paths:
+        - api/**
+        - config/crd/**
+        - charts/forgejo-operator/crds/**
+        - Makefile
+        - go.mod
+        - go.sum
+        - flake.nix
+        - flake.lock
+        - "**/*.nix"
+        - ci/margo/**
+        - .tool-versions
+        - .mise.toml
+        - mise.toml
+        - go.work
+        - go.work.sum
       template: generate-drift
       params:
         command: >-
           CGO_ENABLED=0 go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.16.5 &&
           make generate
     - name: helm:chart
+      paths:
+        - charts/forgejo-operator/**
+        - flake.nix
+        - flake.lock
+        - "**/*.nix"
+        - ci/margo/**
+        - .tool-versions
+        - .mise.toml
+        - mise.toml
+        - go.mod
+        - go.sum
+        - go.work
+        - go.work.sum
       template: helm-lint
       params:
         chart: charts/forgejo-operator
     - name: nix:build
+      paths:
+        - "**/*.go"
+        - go.mod
+        - go.sum
+        - flake.nix
+        - flake.lock
+        - "**/*.nix"
+        - ci/margo/**
+        - .tool-versions
+        - .mise.toml
+        - mise.toml
+        - go.work
+        - go.work.sum
       template: nix-build
       required: true
       params:

@@ -253,6 +253,18 @@ displayed, so commits already pushed show as Verified afterwards. Forgejo before
 
 ## Repository merge detection
 
+`ForgejoRepository.spec.website` sets the homepage link in the repository header.
+`externalWikiURL` makes the Wiki tab link to external docs. `externalTracker.url`
+makes the Issues tab link to an external tracker. To link issue references, set
+`externalTracker.urlFormat` with Forgejo's `{user}`, `{repo}`, and `{index}`
+placeholders and choose `style` (`numeric`, `alphanumeric`, or `regexp`). The
+`regexp` style uses `regexpPattern` to match issue IDs.
+
+Omit a setting to leave it unmanaged. Set `website: ""` to remove the homepage
+link. Set `externalWikiURL: ""` or `externalTracker: {url: ""}` to restore the
+built-in tab. A declared external tab takes precedence over the corresponding
+`features.wiki` or `features.issues` value.
+
 `ForgejoRepository.spec.allowManualMerge` permits Forgejo's native API to record
 an already-landed Git merge. `autodetectManualMerge` enables Forgejo's own detection
 when a push includes a pull request's commits. Git-based merge queues should set

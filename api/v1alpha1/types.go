@@ -198,6 +198,12 @@ type RepositorySpec struct {
 	Topics        []string          `json:"topics,omitempty"`
 	Features      map[string]bool   `json:"features,omitempty"`
 	Import        *RepositoryImport `json:"import,omitempty"`
+	// Website sets the repository homepage. An empty value clears it.
+	Website *string `json:"website,omitempty"`
+	// ExternalWikiURL points the Wiki tab at an external URL. An empty value restores the built-in Wiki.
+	ExternalWikiURL *string `json:"externalWikiURL,omitempty"`
+	// ExternalTracker points the Issues tab at an external tracker.
+	ExternalTracker *RepositoryExternalTracker `json:"externalTracker,omitempty"`
 	// AllowManualMerge permits recording a merge already performed through Git.
 	// Omission leaves the remote setting unchanged; false explicitly disables it.
 	AllowManualMerge *bool `json:"allowManualMerge,omitempty"`
@@ -205,6 +211,20 @@ type RepositorySpec struct {
 	// Omission leaves the remote setting unchanged; false explicitly disables it.
 	AutodetectManualMerge *bool `json:"autodetectManualMerge,omitempty"`
 }
+
+// RepositoryExternalTracker configures Forgejo's external Issues tab.
+type RepositoryExternalTracker struct {
+	// URL is the tracker homepage. An empty value restores built-in Issues.
+	URL string `json:"url"`
+	// URLFormat expands {user}, {repo}, and {index} when linking an issue reference.
+	URLFormat string `json:"urlFormat,omitempty"`
+	// +kubebuilder:default=numeric
+	// +kubebuilder:validation:Enum=numeric;alphanumeric;regexp
+	Style string `json:"style,omitempty"`
+	// RegexpPattern matches issue IDs when Style is regexp.
+	RegexpPattern string `json:"regexpPattern,omitempty"`
+}
+
 type RepositoryImport struct {
 	CloneURL             string                    `json:"cloneURL"`
 	CredentialsSecretRef *corev1.SecretKeySelector `json:"credentialsSecretRef,omitempty"`

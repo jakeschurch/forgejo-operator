@@ -35,13 +35,17 @@ spec:
         - api/**
         - config/crd/**
         - charts/forgejo-operator/crds/**
+        - vendor/**
         - Makefile
+        - GNUmakefile
+        - makefile
         - go.mod
         - go.sum
         - flake.nix
         - flake.lock
         - "**/*.nix"
         - ci/margo/**
+        - "**/.gitattributes"
         - .tool-versions
         - .mise.toml
         - mise.toml
@@ -55,10 +59,14 @@ spec:
     - name: helm:chart
       paths:
         - charts/forgejo-operator/**
+        - Makefile
+        - GNUmakefile
+        - makefile
         - flake.nix
         - flake.lock
         - "**/*.nix"
         - ci/margo/**
+        - "**/.gitattributes"
         - .tool-versions
         - .mise.toml
         - mise.toml
@@ -72,12 +80,16 @@ spec:
     - name: nix:build
       paths:
         - "**/*.go"
+        - Makefile
+        - GNUmakefile
+        - makefile
         - go.mod
         - go.sum
         - flake.nix
         - flake.lock
         - "**/*.nix"
         - ci/margo/**
+        - "**/.gitattributes"
         - .tool-versions
         - .mise.toml
         - mise.toml

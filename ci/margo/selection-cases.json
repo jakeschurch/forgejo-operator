@@ -1,0 +1,183 @@
+{
+  "repository": "forgejo-operator",
+  "suite": "suite.yaml",
+  "shared": [
+    "ci/margo/suite.yaml",
+    "ci/margo/templates/new.yaml",
+    "ci/margo/check.sh",
+    "ci/margo/rendered/ci.json",
+    ".gitattributes",
+    "api/.gitattributes",
+    "flake.lock",
+    "flake.nix",
+    "nix/toolchain.nix",
+    ".tool-versions",
+    ".mise.toml",
+    "mise.toml",
+    "go.mod",
+    "go.sum",
+    "go.work",
+    "go.work.sum",
+    "Makefile",
+    "GNUmakefile",
+    "makefile"
+  ],
+  "cases": [
+    {
+      "name": "docs",
+      "changed": [
+        "docs/new.md"
+      ],
+      "selected": [
+        "go:test"
+      ]
+    },
+    {
+      "name": "app",
+      "changed": [
+        "charts/forgejo-operator/templates/deployment.yaml"
+      ],
+      "selected": [
+        "go:test",
+        "helm:chart"
+      ]
+    },
+    {
+      "name": "chart-crd",
+      "changed": [
+        "charts/forgejo-operator/crds/forgejo.jakeschurch.com_forgejorepositories.yaml"
+      ],
+      "selected": [
+        "go:test",
+        "helm:chart",
+        "generate:drift"
+      ]
+    },
+    {
+      "name": "config-crd",
+      "changed": [
+        "config/crd/bases/forgejo.jakeschurch.com_forgejorepositories.yaml"
+      ],
+      "selected": [
+        "go:test",
+        "generate:drift"
+      ]
+    },
+    {
+      "name": "api-deepcopy",
+      "changed": [
+        "api/v1alpha1/zz_generated.deepcopy.go"
+      ],
+      "selected": [
+        "go:test",
+        "generate:drift",
+        "nix:build"
+      ]
+    },
+    {
+      "name": "chart-lock",
+      "changed": [
+        "charts/forgejo-operator/Chart.lock"
+      ],
+      "selected": [
+        "go:test",
+        "helm:chart"
+      ]
+    },
+    {
+      "name": "chart-values",
+      "changed": [
+        "charts/forgejo-operator/values.yaml"
+      ],
+      "selected": [
+        "go:test",
+        "helm:chart"
+      ]
+    },
+    {
+      "name": "gitignore",
+      "changed": [
+        ".gitignore"
+      ],
+      "selected": [
+        "go:test",
+        "generate:drift"
+      ]
+    },
+    {
+      "name": "nested-gitignore",
+      "changed": [
+        "config/.gitignore"
+      ],
+      "selected": [
+        "go:test",
+        "generate:drift"
+      ]
+    },
+    {
+      "name": "vendor-manifest",
+      "changed": [
+        "vendor/modules.txt"
+      ],
+      "selected": [
+        "go:test",
+        "generate:drift"
+      ]
+    },
+    {
+      "name": "go",
+      "changed": [
+        "internal/controller/controller.go"
+      ],
+      "selected": [
+        "go:test",
+        "nix:build"
+      ]
+    },
+    {
+      "name": "unknown",
+      "changed": [
+        "future/data.bin"
+      ],
+      "selected": [
+        "go:test"
+      ]
+    },
+    {
+      "name": "rendered-ci",
+      "changed": [
+        "ci/margo/rendered/checks.json"
+      ],
+      "selected": [
+        "go:test",
+        "generate:drift",
+        "helm:chart",
+        "nix:build"
+      ]
+    },
+    {
+      "name": "flake-lock",
+      "changed": [
+        "flake.lock"
+      ],
+      "selected": [
+        "go:test",
+        "generate:drift",
+        "helm:chart",
+        "nix:build"
+      ]
+    },
+    {
+      "name": "check-script",
+      "changed": [
+        "ci/margo/check.sh"
+      ],
+      "selected": [
+        "go:test",
+        "generate:drift",
+        "helm:chart",
+        "nix:build"
+      ]
+    }
+  ]
+}

@@ -403,6 +403,30 @@ func repositoryPatch(spec forgev1.RepositorySpec) map[string]any {
 	for feature, enabled := range spec.Features {
 		payload["has_"+feature] = enabled
 	}
+	if spec.Website != nil {
+		payload["website"] = *spec.Website
+	}
+	if spec.ExternalWikiURL != nil {
+		payload["has_wiki"] = true
+		if *spec.ExternalWikiURL != "" {
+			payload["external_wiki"] = map[string]string{"external_wiki_url": *spec.ExternalWikiURL}
+		}
+	}
+	if tracker := spec.ExternalTracker; tracker != nil {
+		payload["has_issues"] = true
+		if tracker.URL != "" {
+			style := tracker.Style
+			if style == "" {
+				style = "numeric"
+			}
+			payload["external_tracker"] = map[string]string{
+				"external_tracker_url":            tracker.URL,
+				"external_tracker_format":         tracker.URLFormat,
+				"external_tracker_style":          style,
+				"external_tracker_regexp_pattern": tracker.RegexpPattern,
+			}
+		}
+	}
 	if spec.AllowManualMerge != nil {
 		payload["allow_manual_merge"] = *spec.AllowManualMerge
 	}

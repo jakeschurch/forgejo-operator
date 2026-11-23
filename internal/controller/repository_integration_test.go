@@ -183,3 +183,95 @@ func TestIntegrationForgejoRepositoryMergeDetection(t *testing.T) {
 		t.Fatalf("manual merge was not disabled: HTTP %d", status)
 	}
 }
+
+func TestIntegrationForgejoRepositoryExternalLinks(t *testing.T) {
+	f := startForgejo(t)
+	h := newOperatorHarness(t, f)
+	api := f.client(t, f.providerToken)
+	ctx := context.Background()
+	const name = "external-links"
+	const website = "https://example.com/docs"
+	const wiki = "https://example.com/wiki"
+	const trackerURL = "https://example.com/issues"
+	const format = "https://example.com/{user}/{repo}/issues/{index}"
+	const pattern = "homelab-[a-z0-9]+"
+	path := "repos/" + integrationAdmin + "/" + name
+
+	site, wikiURL := website, wiki
+	object := &forgev1.ForgejoRepository{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: integrationNamespace},
+		Spec: forgev1.RepositorySpec{
+			CommonSpec: forgev1.CommonSpec{ProviderRef: "default"},
+			Owner:      integrationAdmin, Name: name, Website: &site, ExternalWikiURL: &wikiURL,
+			ExternalTracker: &forgev1.RepositoryExternalTracker{
+				URL: trackerURL, URLFormat: format, Style: "regexp", RegexpPattern: pattern,
+			},
+		},
+	}
+	if err := h.kube.Create(ctx, object); err != nil {
+		t.Fatal(err)
+	}
+	r := RepositoryReconciler{Reconciler: Reconciler{Client: h.kube, Transport: statusLog{t}}}
+	type links struct {
+		Website      string `json:"website"`
+		ExternalWiki *struct {
+			URL string `json:"external_wiki_url"`
+		} `json:"external_wiki"`
+		ExternalTracker *struct {
+			URL     string `json:"external_tracker_url"`
+			Format  string `json:"external_tracker_format"`
+			Style   string `json:"external_tracker_style"`
+			Pattern string `json:"external_tracker_regexp_pattern"`
+		} `json:"external_tracker"`
+		HasIssues bool `json:"has_issues"`
+		HasWiki   bool `json:"has_wiki"`
+	}
+	reconcile := func() links {
+		t.Helper()
+		key := client.ObjectKeyFromObject(object)
+		if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.kube.Get(ctx, key, object); err != nil {
+			t.Fatal(err)
+		}
+		if !meta.IsStatusConditionTrue(object.Status.Conditions, "Ready") {
+			t.Fatalf("repository not Ready: %+v", object.Status.Conditions)
+		}
+		var remote links
+		if err := api.Do(ctx, http.MethodGet, path, nil, &remote); err != nil {
+			t.Fatal(err)
+		}
+		return remote
+	}
+	assertLinks := func(remote links) {
+		t.Helper()
+		tracker := remote.ExternalTracker
+		if remote.Website != website || remote.ExternalWiki == nil || remote.ExternalWiki.URL != wiki ||
+			tracker == nil || tracker.URL != trackerURL || tracker.Format != format ||
+			tracker.Style != "regexp" || tracker.Pattern != pattern {
+			t.Fatalf("unexpected repository links: %+v", remote)
+		}
+	}
+	assertLinks(reconcile())
+
+	// Include an unrelated PATCH when the link fields become unmanaged.
+	object.Spec.Website, object.Spec.ExternalWikiURL, object.Spec.ExternalTracker = nil, nil, nil
+	object.Spec.Description = "Operator link test"
+	if err := h.kube.Update(ctx, object); err != nil {
+		t.Fatal(err)
+	}
+	assertLinks(reconcile())
+
+	empty := ""
+	object.Spec.Website, object.Spec.ExternalWikiURL = &empty, &empty
+	object.Spec.ExternalTracker = &forgev1.RepositoryExternalTracker{}
+	if err := h.kube.Update(ctx, object); err != nil {
+		t.Fatal(err)
+	}
+	remote := reconcile()
+	if remote.Website != "" || remote.ExternalWiki != nil || remote.ExternalTracker != nil ||
+		!remote.HasIssues || !remote.HasWiki {
+		t.Fatalf("expected built-in Issues and Wiki with no Website: %+v", remote)
+	}
+}

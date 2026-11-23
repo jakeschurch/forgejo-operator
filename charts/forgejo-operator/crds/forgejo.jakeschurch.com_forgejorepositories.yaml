@@ -57,6 +57,35 @@ spec:
                 type: string
               description:
                 type: string
+              externalTracker:
+                description: ExternalTracker points the Issues tab at an external
+                  tracker.
+                properties:
+                  regexpPattern:
+                    description: RegexpPattern matches issue IDs when Style is regexp.
+                    type: string
+                  style:
+                    default: numeric
+                    enum:
+                    - numeric
+                    - alphanumeric
+                    - regexp
+                    type: string
+                  url:
+                    description: URL is the tracker homepage. An empty value restores
+                      built-in Issues.
+                    type: string
+                  urlFormat:
+                    description: URLFormat expands {user}, {repo}, and {index} when
+                      linking an issue reference.
+                    type: string
+                required:
+                - url
+                type: object
+              externalWikiURL:
+                description: ExternalWikiURL points the Wiki tab at an external URL.
+                  An empty value restores the built-in Wiki.
+                type: string
               features:
                 additionalProperties:
                   type: boolean
@@ -112,6 +141,10 @@ spec:
                   type: string
                 type: array
               visibility:
+                type: string
+              website:
+                description: Website sets the repository homepage. An empty value
+                  clears it.
                 type: string
             required:
             - name

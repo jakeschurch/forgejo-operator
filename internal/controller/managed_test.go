@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/jakeschurch/forgejo-operator/internal/credentials"
 	forgeapi "github.com/jakeschurch/forgejo-operator/internal/forgejo"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -869,22 +871,25 @@ func TestPushMirrorCreateSendsRemoteUsername(t *testing.T) {
 	object, kube := pushMirrorFixture("x-access-token")
 	var created map[string]any
 	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Host == "github.com" {
+			return receivePackAdvertisement(nil), nil
+		}
 		if r.Method == http.MethodPost {
 			if err := json.NewDecoder(r.Body).Decode(&created); err != nil {
 				return nil, err
 			}
-			return response(http.StatusCreated, `{"id":5}`), nil
+			return response(http.StatusCreated, `{"remote_name":"remote_mirror_new"}`), nil
 		}
 		return response(http.StatusOK, `[]`), nil
 	})
 	api, _ := forgeapi.New("https://forgejo.invalid", "admin", forgeapi.WithHTTPClient(&http.Client{Transport: transport}), forgeapi.WithRetries(0))
-	reconciler := managedReconciler{Reconciler: Reconciler{Client: kube}}
+	reconciler := managedReconciler{Reconciler: Reconciler{Client: kube, Transport: transport}}
 	id, err := reconciler.reconcile(context.Background(), api, object)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if id != "5" {
-		t.Fatalf("id=%q, want 5", id)
+	if id != "remote_mirror_new" {
+		t.Fatalf("id=%q, want the created mirror's remote_name", id)
 	}
 	if created["remote_username"] != "x-access-token" {
 		t.Fatalf("create payload did not carry remote_username: %#v", created)
@@ -900,16 +905,19 @@ func TestPushMirrorCreateOmitsEmptyRemoteUsername(t *testing.T) {
 	object, kube := pushMirrorFixture("")
 	var created map[string]any
 	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Host == "github.com" {
+			return receivePackAdvertisement(nil), nil
+		}
 		if r.Method == http.MethodPost {
 			if err := json.NewDecoder(r.Body).Decode(&created); err != nil {
 				return nil, err
 			}
-			return response(http.StatusCreated, `{"id":5}`), nil
+			return response(http.StatusCreated, `{"remote_name":"remote_mirror_new"}`), nil
 		}
 		return response(http.StatusOK, `[]`), nil
 	})
 	api, _ := forgeapi.New("https://forgejo.invalid", "admin", forgeapi.WithHTTPClient(&http.Client{Transport: transport}), forgeapi.WithRetries(0))
-	reconciler := managedReconciler{Reconciler: Reconciler{Client: kube}}
+	reconciler := managedReconciler{Reconciler: Reconciler{Client: kube, Transport: transport}}
 	if _, err := reconciler.reconcile(context.Background(), api, object); err != nil {
 		t.Fatal(err)
 	}
@@ -939,8 +947,8 @@ func TestPushMirrorAdoptRecordsHashWithoutWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if id != "5" {
-		t.Fatalf("id=%q, want the adopted mirror 5", id)
+	if id != "remote_mirror_a" {
+		t.Fatalf("id=%q, want the adopted mirror's remote_name", id)
 	}
 	if object.Status.CredentialHash != pushMirrorCredentialHash("x-access-token", "ghp-sensitive") {
 		t.Fatalf("adoption did not record the credential hash: %q", object.Status.CredentialHash)
@@ -960,13 +968,16 @@ func requireReadOnly(t *testing.T, requests []string) {
 func TestPushMirrorCreateRecordsHash(t *testing.T) {
 	object, kube := pushMirrorFixture("x-access-token")
 	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Host == "github.com" {
+			return receivePackAdvertisement(nil), nil
+		}
 		if r.Method == http.MethodPost {
-			return response(http.StatusCreated, `{"id":5}`), nil
+			return response(http.StatusCreated, `{"remote_name":"remote_mirror_new"}`), nil
 		}
 		return response(http.StatusOK, `[]`), nil
 	})
 	api, _ := forgeapi.New("https://forgejo.invalid", "admin", forgeapi.WithHTTPClient(&http.Client{Transport: transport}), forgeapi.WithRetries(0))
-	reconciler := managedReconciler{Reconciler: Reconciler{Client: kube}}
+	reconciler := managedReconciler{Reconciler: Reconciler{Client: kube, Transport: transport}}
 	if _, err := reconciler.reconcile(context.Background(), api, object); err != nil {
 		t.Fatal(err)
 	}
@@ -1012,9 +1023,38 @@ type mirrorWorld struct {
 	createPayload map[string]any
 	// destinationStatus, when set, is returned instead of an advertisement.
 	destinationStatus int
+	// noMirror makes Forgejo list no push mirror, so the reconcile creates one.
+	noMirror bool
+	// listStatus, when set, is returned instead of the push mirror listing.
+	listStatus int
 }
 
 func pkt(s string) string { return fmt.Sprintf("%04x%s", len(s)+4, s) }
+
+// receivePackAdvertisement is a smart-HTTP receive-pack ref advertisement of
+// refs (name -> oid). No refs is an empty repository.
+func receivePackAdvertisement(refs map[string]string) *http.Response {
+	names := make([]string, 0, len(refs))
+	for name := range refs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	body := pkt("# service=git-receive-pack\n") + "0000"
+	if len(names) == 0 {
+		body += pkt(strings.Repeat("0", 40) + " capabilities^{}\x00report-status delete-refs ofs-delta\n")
+	}
+	for i, name := range names {
+		line := refs[name] + " " + name
+		if i == 0 {
+			line += "\x00report-status delete-refs ofs-delta"
+		}
+		body += pkt(line + "\n")
+	}
+	body += "0000"
+	resp := response(http.StatusOK, body)
+	resp.Header.Set("Content-Type", "application/x-git-receive-pack-advertisement")
+	return resp
+}
 
 func (w *mirrorWorld) transport() roundTripFunc {
 	return func(r *http.Request) (*http.Response, error) {
@@ -1027,27 +1067,17 @@ func (w *mirrorWorld) transport() roundTripFunc {
 			if w.destinationStatus != 0 {
 				return response(w.destinationStatus, ""), nil
 			}
-			names := make([]string, 0, len(w.destination))
-			for name := range w.destination {
-				names = append(names, name)
-			}
-			sort.Strings(names)
-			body := pkt("# service=git-receive-pack\n") + "0000"
-			for i, name := range names {
-				line := w.destination[name] + " " + name
-				if i == 0 {
-					line += "\x00report-status delete-refs ofs-delta"
-				}
-				body += pkt(line + "\n")
-			}
-			body += "0000"
-			resp := response(http.StatusOK, body)
-			resp.Header.Set("Content-Type", "application/x-git-receive-pack-advertisement")
-			return resp, nil
+			return receivePackAdvertisement(w.destination), nil
 		}
 		const repo = "/api/v1/repos/jake/homelab"
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == repo+"/push_mirrors":
+			if w.listStatus != 0 {
+				return response(w.listStatus, ""), nil
+			}
+			if w.noMirror {
+				return response(http.StatusOK, `[]`), nil
+			}
 			lastError, _ := json.Marshal(w.lastError)
 			return response(http.StatusOK, `[{"remote_name":"remote_mirror_old","remote_address":"https://github.com/jakeschurch/homelab.git","last_error":`+string(lastError)+`}]`), nil
 		case r.Method == http.MethodGet && r.URL.Path == repo+"/git/refs":
@@ -1073,11 +1103,16 @@ func (w *mirrorWorld) transport() roundTripFunc {
 			return response(http.StatusBadRequest, ""), nil
 		case r.Method == http.MethodDelete && r.URL.Path == repo+"/push_mirrors/remote_mirror_old":
 			return response(http.StatusNoContent, ""), nil
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, repo+"/push_mirrors/"):
+			// What Forgejo answers for a name that is not a mirror, such as
+			// the legacy "0": a 404 the delete path treats as already gone.
+			return response(http.StatusNotFound, ""), nil
 		case r.Method == http.MethodPost && r.URL.Path == repo+"/push_mirrors":
 			if err := json.NewDecoder(r.Body).Decode(&w.createPayload); err != nil {
 				return nil, err
 			}
-			return response(http.StatusCreated, `{"id":9}`), nil
+			// Forgejo's push mirror objects carry no numeric id.
+			return response(http.StatusCreated, `{"remote_name":"remote_mirror_new","remote_address":"https://github.com/jakeschurch/homelab.git"}`), nil
 		case r.Method == http.MethodPost && r.URL.Path == repo+"/push_mirrors-sync":
 			return response(http.StatusOK, ""), nil
 		}
@@ -1123,9 +1158,19 @@ func cleanMirrorWorld() *mirrorWorld {
 // while the Secret holds "ghp-sensitive".
 func runPushMirrorReconcile(t *testing.T, storedHash string, world *mirrorWorld) (forgev1.ForgejoPushMirror, ctrl.Result) {
 	t.Helper()
+	return runPushMirrorReconcileWith(t, world, func(object *forgev1.ForgejoPushMirror) {
+		object.Status.CredentialHash = storedHash
+		object.Status.RemoteID = "remote_mirror_old"
+	})
+}
+
+// runPushMirrorReconcileWith is runPushMirrorReconcile with the stored object
+// shaped by mutate. A deleted object is returned zero-valued once its
+// finalizer is gone.
+func runPushMirrorReconcileWith(t *testing.T, world *mirrorWorld, mutate func(*forgev1.ForgejoPushMirror)) (forgev1.ForgejoPushMirror, ctrl.Result) {
+	t.Helper()
 	object, _ := pushMirrorFixture("x-access-token")
-	object.Status.CredentialHash = storedHash
-	object.Status.RemoteID = "0"
+	mutate(object)
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	_ = forgev1.AddToScheme(scheme)
@@ -1151,7 +1196,7 @@ func runPushMirrorReconcile(t *testing.T, storedHash string, world *mirrorWorld)
 		t.Fatal(err)
 	}
 	var stored forgev1.ForgejoPushMirror
-	if err := kube.Get(context.Background(), key, &stored); err != nil {
+	if err := kube.Get(context.Background(), key, &stored); err != nil && !apierrors.IsNotFound(err) {
 		t.Fatal(err)
 	}
 	return stored, result
@@ -1199,7 +1244,7 @@ func TestPushMirrorRotatesWhenGuardIsClean(t *testing.T) {
 		world.createPayload["remote_address"] != "https://github.com/jakeschurch/homelab.git" || world.createPayload["sync_on_commit"] != false {
 		t.Fatalf("recreate payload differs from creation: %#v", world.createPayload)
 	}
-	if stored.Status.CredentialHash != newMirrorHash || stored.Status.RemoteID != "9" {
+	if stored.Status.CredentialHash != newMirrorHash || stored.Status.RemoteID != "remote_mirror_new" {
 		t.Fatalf("hash=%q remoteID=%q after rotation", stored.Status.CredentialHash, stored.Status.RemoteID)
 	}
 	if degraded := meta.FindStatusCondition(stored.Status.Conditions, "Degraded"); degraded == nil || degraded.Status != metav1.ConditionFalse {
@@ -1267,6 +1312,203 @@ func TestPushMirrorRotationBlockedWhenDestinationUnreadable(t *testing.T) {
 	world.destinationStatus = http.StatusUnauthorized
 	stored, result := runPushMirrorReconcile(t, oldMirrorHash, world)
 	requireBlocked(t, world, stored, result, reasonDestinationRefsUnreadable, "401")
+}
+
+// argocd-tag-updater-cnu: creating a mirror arms the same `git push --mirror`
+// a rotation does, so creation is guarded too.
+
+// runPushMirrorCreate reconciles an object with no recorded mirror against a
+// Forgejo that lists none, so the reconcile takes the create path.
+func runPushMirrorCreate(t *testing.T, world *mirrorWorld) (forgev1.ForgejoPushMirror, ctrl.Result) {
+	t.Helper()
+	world.noMirror = true
+	return runPushMirrorReconcileWith(t, world, func(*forgev1.ForgejoPushMirror) {})
+}
+
+// requireCreateBlocked asserts the create was refused: nothing written (above
+// all, no POST that would arm a mirror push), no hash or id recorded, Degraded
+// with reason, and requeued.
+func requireCreateBlocked(t *testing.T, world *mirrorWorld, stored forgev1.ForgejoPushMirror, result ctrl.Result, reason string, mentions ...string) {
+	t.Helper()
+	if writes := world.writes(); len(writes) != 0 {
+		t.Fatalf("a blocked create wrote to Forgejo: %v", writes)
+	}
+	if stored.Status.CredentialHash != "" || stored.Status.RemoteID != "" {
+		t.Fatalf("a blocked create recorded hash=%q remoteID=%q", stored.Status.CredentialHash, stored.Status.RemoteID)
+	}
+	degraded := meta.FindStatusCondition(stored.Status.Conditions, "Degraded")
+	if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != reason {
+		t.Fatalf("degraded=%+v, want True/%s", degraded, reason)
+	}
+	if !strings.Contains(degraded.Message, "creation is blocked") {
+		t.Fatalf("Degraded message %q does not say creation was blocked", degraded.Message)
+	}
+	for _, mention := range mentions {
+		if !strings.Contains(degraded.Message, mention) {
+			t.Fatalf("Degraded message %q does not name %q", degraded.Message, mention)
+		}
+	}
+	if strings.Contains(degraded.Message, "ghp-sensitive") {
+		t.Fatal("Degraded message leaks the credential")
+	}
+	if result.RequeueAfter == 0 {
+		t.Fatal("a blocked create must be retried")
+	}
+}
+
+// requireCreated asserts the mirror was created with the declared credential
+// after the destination was read with it, and its remote_name recorded.
+func requireCreated(t *testing.T, world *mirrorWorld, stored forgev1.ForgejoPushMirror) {
+	t.Helper()
+	want := []string{"POST /api/v1/repos/jake/homelab/push_mirrors"}
+	if got := world.writes(); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("writes=%v, want %v", got, want)
+	}
+	if world.destAuthUser != "x-access-token" || world.destAuthPass != "ghp-sensitive" {
+		t.Fatal("destination refs were not read with the mirror's credential before creating it")
+	}
+	if stored.Status.CredentialHash != newMirrorHash || stored.Status.RemoteID != "remote_mirror_new" {
+		t.Fatalf("hash=%q remoteID=%q after create", stored.Status.CredentialHash, stored.Status.RemoteID)
+	}
+	if degraded := meta.FindStatusCondition(stored.Status.Conditions, "Degraded"); degraded == nil || degraded.Status != metav1.ConditionFalse {
+		t.Fatalf("degraded=%+v", degraded)
+	}
+}
+
+// The 2026-09-22 shape on the create path: refs that only exist on GitHub.
+func TestPushMirrorCreateBlockedWhenDestinationRefMissingFromSource(t *testing.T) {
+	world := cleanMirrorWorld()
+	world.destination["refs/heads/only-on-github"] = mirrorOID1
+	stored, result := runPushMirrorCreate(t, world)
+	requireCreateBlocked(t, world, stored, result, reasonDestinationHasRefsMissingFromSource, "refs/heads/only-on-github")
+}
+
+func TestPushMirrorCreateBlockedWhenDestinationObjectMissingFromSource(t *testing.T) {
+	world := cleanMirrorWorld()
+	world.destination["refs/heads/main"] = mirrorGone
+	stored, result := runPushMirrorCreate(t, world)
+	requireCreateBlocked(t, world, stored, result, reasonDestinationHasObjectsMissingFromSource, "refs/heads/main")
+}
+
+// An unreadable destination is not evidence of safety, whatever the status.
+func TestPushMirrorCreateBlockedWhenDestinationUnreadable(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusNotFound} {
+		world := cleanMirrorWorld()
+		world.destinationStatus = status
+		stored, result := runPushMirrorCreate(t, world)
+		requireCreateBlocked(t, world, stored, result, reasonDestinationRefsUnreadable, strconv.Itoa(status))
+	}
+}
+
+func TestPushMirrorCreateAllowedForEmptyDestination(t *testing.T) {
+	world := cleanMirrorWorld()
+	world.destination = map[string]string{}
+	stored, _ := runPushMirrorCreate(t, world)
+	requireCreated(t, world, stored)
+}
+
+// A destination behind Forgejo (a stale branch whose older commit Forgejo
+// holds) loses nothing to the mirror push.
+func TestPushMirrorCreateAllowedForSubsetDestination(t *testing.T) {
+	world := cleanMirrorWorld()
+	stored, _ := runPushMirrorCreate(t, world)
+	requireCreated(t, world, stored)
+}
+
+// argocd-tag-updater-zm3g.16: Forgejo's push mirror listing has no id, so
+// remoteID was stored as "0". The next reconcile records the remote_name it
+// finds by destination URL, writing nothing to Forgejo -- even when a
+// rotation is due and blocked.
+func TestPushMirrorLegacyRemoteIDMigratesToRemoteName(t *testing.T) {
+	for _, tc := range []struct {
+		name, hash string
+		blocked    bool
+	}{
+		{"unchanged credential", newMirrorHash, false},
+		{"adoption", "", false},
+		{"rotation blocked", oldMirrorHash, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, legacy := range []string{"0", ""} {
+				world := cleanMirrorWorld()
+				if tc.blocked {
+					world.lastError = "push failed"
+				}
+				stored, _ := runPushMirrorReconcileWith(t, world, func(object *forgev1.ForgejoPushMirror) {
+					object.Status.CredentialHash = tc.hash
+					object.Status.RemoteID = legacy
+				})
+				if stored.Status.RemoteID != "remote_mirror_old" {
+					t.Fatalf("remoteID %q migrated to %q, want remote_mirror_old", legacy, stored.Status.RemoteID)
+				}
+				requireReadOnly(t, world.requests)
+			}
+		})
+	}
+}
+
+// deletionPolicy: Delete must delete the mirror by its remote_name. A legacy
+// remoteID "0" is resolved by destination URL first; DELETE push_mirrors/0
+// would 404, be taken as success, and drop the finalizer with the mirror alive.
+func TestPushMirrorDeleteUsesRemoteName(t *testing.T) {
+	for _, remoteID := range []string{"remote_mirror_old", "0"} {
+		world := cleanMirrorWorld()
+		stored, _ := runPushMirrorReconcileWith(t, world, func(object *forgev1.ForgejoPushMirror) {
+			now := metav1.Now()
+			object.Spec.DeletionPolicy = forgev1.DeletionPolicyDelete
+			object.Finalizers = []string{finalizer}
+			object.DeletionTimestamp = &now
+			object.Status.CredentialHash = newMirrorHash
+			object.Status.RemoteID = remoteID
+		})
+		want := []string{"DELETE /api/v1/repos/jake/homelab/push_mirrors/remote_mirror_old"}
+		if got := world.writes(); strings.Join(got, "\n") != strings.Join(want, "\n") {
+			t.Fatalf("remoteID %q: writes=%v, want %v", remoteID, got, want)
+		}
+		if contains(stored.Finalizers, finalizer) {
+			t.Fatalf("remoteID %q: finalizer kept after a successful delete", remoteID)
+		}
+	}
+}
+
+// A legacy remoteID that cannot be resolved (the listing fails) must keep the
+// finalizer: dropping it would leave the mirror running with no owner.
+func TestPushMirrorDeleteKeepsFinalizerWhenLookupFails(t *testing.T) {
+	world := cleanMirrorWorld()
+	world.listStatus = http.StatusInternalServerError
+	stored, result := runPushMirrorReconcileWith(t, world, func(object *forgev1.ForgejoPushMirror) {
+		now := metav1.Now()
+		object.Spec.DeletionPolicy = forgev1.DeletionPolicyDelete
+		object.Finalizers = []string{finalizer}
+		object.DeletionTimestamp = &now
+		object.Status.RemoteID = "0"
+	})
+	if writes := world.writes(); len(writes) != 0 {
+		t.Fatalf("an unresolved mirror was written to: %v", writes)
+	}
+	if !contains(stored.Finalizers, finalizer) || result.RequeueAfter == 0 {
+		t.Fatalf("finalizers=%v requeue=%v: a failed lookup must keep the finalizer and retry", stored.Finalizers, result.RequeueAfter)
+	}
+}
+
+// A mirror already gone (404 for its real name) is a successful delete.
+func TestPushMirrorDeleteOfMissingMirrorSucceeds(t *testing.T) {
+	world := cleanMirrorWorld()
+	world.noMirror = true
+	stored, _ := runPushMirrorReconcileWith(t, world, func(object *forgev1.ForgejoPushMirror) {
+		now := metav1.Now()
+		object.Spec.DeletionPolicy = forgev1.DeletionPolicyDelete
+		object.Finalizers = []string{finalizer}
+		object.DeletionTimestamp = &now
+		object.Status.RemoteID = "remote_mirror_gone"
+	})
+	want := []string{"DELETE /api/v1/repos/jake/homelab/push_mirrors/remote_mirror_gone"}
+	if got := world.writes(); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("writes=%v, want %v", got, want)
+	}
+	if contains(stored.Finalizers, finalizer) {
+		t.Fatal("finalizer kept after the mirror was already gone")
+	}
 }
 
 const (

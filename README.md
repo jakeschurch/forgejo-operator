@@ -22,8 +22,12 @@ helm lint charts/forgejo-operator
 nix flake check
 ```
 
-Releases use SemVer tags (`v0.x.y`). Images are published to
-`harbor.oci-registry.svc.cluster.local/foundry/forgejo-operator`.
+Margo publishes releases from `main` to
+`harbor.oci-registry.svc.cluster.local/foundry/forgejo-operator`. Published
+images and their source commits use tags of the form
+`forgejo-operator.main.<UTC timestamp>.<short commit SHA>`. A docs-only
+change that leaves the image and deployment inputs unchanged retains the
+previous tag and digest.
 
 CI note: merge-queue probes stage the main image build on the trusted farm so
 the following main build is a cache hit.

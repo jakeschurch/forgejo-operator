@@ -1,0 +1,15 @@
+apiVersion: ci.foundrybox.dev/v1alpha1
+kind: Release
+metadata:
+  name: forgejo-operator
+  namespace: argo
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+    ci.foundrybox.dev/cutover-revision: e2cc6086a099dddbeb0cb34629d02fbf639c9537
+spec:
+  queue: forgejo-operator
+  images:
+  - forgejo-operator
+  beforeDeploy:
+    steps:
+    - template: sbom
